@@ -1,0 +1,25 @@
+[book]
+authors = ["mini-harness contributors"]
+language = "zh"
+src = "docs"
+title = "mini-harness：从源码读懂 Agent Harness"
+description = "一份沿着真实请求阅读 mini-harness 源码的中文教程。"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+additional-css = ["custom.css"]
+additional-js = ["comments.js"]
+git-repository-url = "https://github.com/nothiny/mini-harness"
+site-url = "/"
+no-section-label = true
+
+[output.html.playground]
+runnable = false
+
+[output.html.redirect]
+# The homepage is also emitted at the book root by mdBook 0.4.
+"00-overview.html" = "tutorial/00-overview.html"
+"tutorial/README.html" = "index.html"

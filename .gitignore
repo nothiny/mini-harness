@@ -1,0 +1,20 @@
+/target
+.env
+*.log
+.DS_Store
+
+# Only the published tutorial sources are eligible; other docs stay private.
+/docs/*
+!/docs/SUMMARY.md
+!/docs/tutorial/
+
+# Generated mdBook website.
+/book/
+
+# mini-harness runtime state (event logs, checkpoints, lock files).
+# These are produced by running the binary/TUI in the repo, not source.
+mini-harness-tui.jsonl
+mini-harness-tui.checkpoint.json
+*.jsonl.lock
+*.checkpoint.json.lock
+

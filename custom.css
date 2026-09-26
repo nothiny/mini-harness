@@ -1,0 +1,123 @@
+/* ── Typography for the mini-harness tutorial ─────────────────────────────
+   mdBook's defaults are tuned for dense Latin text: paragraphs and lists use
+   `line-height: 1.45em`, and headings only set a top margin. Chinese text
+   needs more leading, and headings need breathing room on both sides. These
+   rules are loaded after the built-in theme, so equal-specificity selectors
+   win here. */
+
+/* Reading rhythm: body text and lists share one comfortable leading. */
+.content p,
+.content li,
+.content dd,
+.content blockquote {
+  line-height: 1.85;
+}
+
+.content p {
+  margin-block: 0 1.05em;
+}
+
+/* Headings: tighter leading inside, clear space above and below. */
+.content main h1,
+.content main h2,
+.content main h3,
+.content main h4 {
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.content main h2 {
+  margin-block: 2.4em 0.85em;
+  padding-block-end: 0.3em;
+  border-bottom: 1px solid var(--quote-border);
+}
+
+.content main h3 {
+  margin-block: 2em 0.7em;
+}
+
+.content main h4 {
+  margin-block: 1.7em 0.55em;
+}
+
+/* Don't push the first heading away from the top of the page. */
+.content main > h1:first-child,
+.content main > h2:first-child,
+.content main > h3:first-child {
+  margin-block-start: 0;
+}
+
+/* Lists. */
+.content ul,
+.content ol {
+  margin-block: 0 1.05em;
+  padding-inline-start: 1.8em;
+}
+
+.content li {
+  margin-block: 0.3em;
+}
+
+.content li > p {
+  margin-block: 0 0.55em;
+}
+
+/* Code. */
+.content main code {
+  font-variant-ligatures: none;
+}
+
+.content main pre {
+  margin-block: 1.25em;
+  line-height: 1.7;
+  border-radius: 6px;
+}
+
+.content main pre code {
+  line-height: 1.7;
+}
+
+/* Quotes. */
+.content main blockquote {
+  margin-block: 1.25em;
+  padding: 0.55em 1.1em;
+  border-inline-start: 4px solid var(--quote-border);
+}
+
+.content main blockquote p:last-child {
+  margin-block-end: 0;
+}
+
+/* Tables. */
+.content main table {
+  margin-block: 1.35em;
+  border-collapse: collapse;
+}
+
+.content main th,
+.content main td {
+  padding: 0.5em 0.85em;
+  line-height: 1.65;
+}
+
+/* Horizontal rules. */
+.content main hr {
+  margin-block: 2.4em;
+  border: 0;
+  border-top: 1px solid var(--quote-border);
+}
+
+/* Giscus comment thread appended by comments.js. */
+.content main .giscus-thread {
+  margin-block-start: 3.2em;
+}
+.content main .giscus-thread h2 {
+  border-bottom: 0;
+}
+
+/* Images. */
+.content img {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+}
