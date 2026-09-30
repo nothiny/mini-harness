@@ -14,8 +14,9 @@ import { tmpdir } from "node:os";
 import { isatty } from "node:tty";
 import { render } from "ink";
 import React from "react";
-import { HarnessClient, findBinary } from "./client.js";
+import { HarnessClient, findBinary, type HarnessClientLike, type SessionContext } from "./client.js";
 import { ChatApp } from "./ChatApp.js";
+import { DemoClient } from "./demoClient.js";
 
 async function main() {
   const { values } = parseArgs({
@@ -24,6 +25,7 @@ async function main() {
       model: { type: "string", short: "m" },
       workspace: { type: "string", short: "w" },
       binary: { type: "string" },
+      demo: { type: "boolean", default: false },
     },
   });
 
@@ -35,7 +37,6 @@ async function main() {
     process.exit(1);
   }
 
-  const binary = findBinary(values.binary);
   const workspace = resolve(values.workspace ?? ".");
 
   // Unique log per launch — no "event_log_not_empty" errors.
@@ -44,10 +45,12 @@ async function main() {
     `mini-harness-${Date.now()}-${process.pid}.jsonl`,
   );
 
-  const client = new HarnessClient(binary);
+  const client: HarnessClientLike = values.demo
+    ? new DemoClient()
+    : new HarnessClient(findBinary(values.binary));
 
   try {
-    await client.negotiate();
+    if (client instanceof HarnessClient) await client.negotiate();
 
     const response = await client.request("session.create", {
       event_log: eventLog,
@@ -60,10 +63,25 @@ async function main() {
       throw new Error(response.error.message);
     }
 
-    const sessionId = (response.result as any).session_id;
+    const result = response.result as { session_id: string; context?: SessionContext };
+    const sessionId = result.session_id;
+    // Older servers only return the session id. Keep the header truthful in
+    // that case by using the trusted CLI values and marking the execution
+    // details as unknown instead of pretending the provider is `mock`.
+    const context: SessionContext = result.context ?? {
+      workspace,
+      provider: String(values.provider),
+      model: values.model ?? null,
+      execution_environment: {
+        platform: "unknown",
+        filesystem: "unknown",
+        network: "unknown",
+        environment: "unknown",
+      },
+    };
 
     const instance = render(
-      React.createElement(ChatApp, { client, sessionId }),
+      React.createElement(ChatApp, { client, sessionId, context }),
       { exitOnCtrlC: false },
     );
 

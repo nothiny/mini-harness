@@ -24,6 +24,18 @@ export interface JsonRpcResponse {
   error?: { code: string; message: string };
 }
 
+export interface SessionContext {
+  workspace?: string;
+  provider?: string;
+  model?: string | null;
+  execution_environment?: {
+    platform?: string;
+    filesystem?: string;
+    network?: string;
+    environment?: string;
+  };
+}
+
 export interface EventNotification {
   seq: number;
   session_id: string;
@@ -38,7 +50,33 @@ export interface EventNotification {
     outcome?: string;
     /** Safe one-line summary of the tool input (command, path, etc). */
     input_summary?: string;
+    input_summary_truncated?: boolean;
+    input_summary_redacted?: boolean;
+    /** Structured, redacted detail intended for approval/detail UI. */
+    input_detail?: {
+      kind?: string;
+      command?: string;
+      path?: string;
+      old_preview?: { text?: string; truncated?: boolean; redacted?: boolean };
+      new_preview?: { text?: string; truncated?: boolean; redacted?: boolean };
+      truncated?: boolean;
+      redacted?: boolean;
+    };
+    result_summary?: {
+      kind?: string;
+      [key: string]: unknown;
+    };
+    error_summary?: { text?: string; truncated?: boolean; redacted?: boolean };
+    reason_truncated?: boolean;
+    reason_redacted?: boolean;
   };
+}
+
+/** Small structural interface used by the UI and the demo client. */
+export interface HarnessClientLike {
+  request(method: string, params?: Record<string, unknown>): Promise<JsonRpcResponse>;
+  onEvent(listener: (notification: EventNotification) => void): () => void;
+  shutdown(): Promise<void>;
 }
 
 /** Resolves this source file's directory (the project is ESM-only). */

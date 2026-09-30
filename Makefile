@@ -5,7 +5,7 @@ BINARY   := target/debug/mini-harness
 UI_DIR   := ui
 DEEPSEEK_MODEL := deepseek-flash
 
-.PHONY: fmt fmt-check clippy test check check-docs build run tui tui-rs events serve doctor
+.PHONY: fmt fmt-check clippy test check check-docs build run tui tui-demo tui-rs events serve doctor
 
 # ── Rust baseline ──────────────────────────────────────────────────────────
 
@@ -46,10 +46,14 @@ run-mock: $(BINARY)
 # ── TUI ────────────────────────────────────────────────────────────────────
 
 ## tui: terminal ChatGPT with DeepSeek (Ink, fresh session per launch)
-tui: $(BINARY)
+tui: build
 	cd $(UI_DIR) && npx tsx src/main.tsx \
 		--provider deepseek --model $(DEEPSEEK_MODEL) \
 		--binary ../$(BINARY)
+
+## tui-demo: offline Ink UI demonstration using the deterministic fake client
+tui-demo:
+	cd $(UI_DIR) && npm run demo
 
 ## tui-rs: the Rust-built TUI (no Node dependency, auto line-mode in pipes)
 tui-rs: $(BINARY)

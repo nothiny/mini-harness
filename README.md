@@ -94,9 +94,12 @@ bash = "allow"   # 模型可不经确认执行任意命令，仅限受控环境
 cd ui && npm install
 
 make tui          # 接入 DeepSeek
+make tui-demo     # 不启动 Rust 后端，离线播放工具调用、审批和回答
 # 或直接运行：npx tsx src/main.tsx --provider deepseek --workspace .. \
 #             [--provider mock --workspace /tmp --event-log /tmp/tui.jsonl]
 ```
+
+UI 改动可以用 `cd ui && npm run typecheck && npm test` 做本地检查。`tui-demo` 使用固定的假 client，不会读取 API key，也不会修改 workspace。
 
 保留审批、由使用者决定是否执行时，工具触发审批在 TUI 里交互确认后才会执行。
 

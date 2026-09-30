@@ -1,487 +1,264 @@
-/**
- * Terminal ChatGPT — a minimal chat UI for mini-harness.
- *
- * You: prompt
- *   ⚙ tool indicator
- * Assistant: response
- * You: _
- *
- * Keys: Enter send (queues while a turn runs) · y/n approve · Ctrl-C ×2 exit · Ctrl-D exit
- */
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Box, Static, Text, useApp, useInput } from "ink";
+import type { EventNotification, HarnessClientLike, SessionContext } from "./client.js";
+import { ApprovalPanel } from "./ApprovalPanel.js";
+import { Composer } from "./Composer.js";
+import { Markdown } from "./Markdown.js";
+import { ToolRow, type ToolDetails, type ToolDisplay } from "./ToolRow.js";
+import { useTerminalSize, wrapText } from "./layout.js";
+import { addHistory } from "./editor.js";
 
-import React, {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
-import { Box, Text, useApp, useInput } from "ink";
-import type { HarnessClient, EventNotification } from "./client.js";
+type Stage = "idle" | "submitting" | "waiting" | "running" | "approval" | "cancelling" | "cancelled";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+interface ActiveTool extends ToolDisplay { turnId: string; }
+interface HistoryEntry { id: string; role: "user" | "assistant" | "error" | "tool"; text?: string; tool?: ToolDisplay; }
+interface PendingApproval { turnId: string; callId: string; toolName: string; inputSummary: string; details?: ToolDetails; }
+interface PendingTurn { turnId: string; text: string; wasQueued: boolean; }
 
-interface ChatEntry {
-  role: "user" | "assistant" | "tool" | "error";
-  text: string;
+interface ChatAppProps { client: HarnessClientLike; sessionId: string; context?: SessionContext; }
+
+function contextLabel(context?: SessionContext): string {
+  if (!context) return "执行环境信息未获取";
+  const environment = context.execution_environment;
+  return [context.provider, context.model ?? "model 未获取", environment?.filesystem, environment?.network, environment?.environment].filter(Boolean).join(" · ");
 }
 
-interface PendingApproval {
-  turnId: string;
-  callId: string;
-  toolName: string;
-  inputSummary: string;
-}
-
-/** Submitted to the server, accepted, but not started yet. */
-interface QueuedTurn {
-  turnId: string;
-  text: string;
-}
-
-/** Local FIFO entry for the turn pump. */
-interface PendingTurn {
-  turnId: string;
-  text: string;
-  wasQueued: boolean;
-}
-
-// ---------------------------------------------------------------------------
-// CJK-aware text wrapping
-// ---------------------------------------------------------------------------
-
-function charWidth(char: string): number {
-  const code = char.codePointAt(0) ?? 0;
-  if (
-    (code >= 0x4e00 && code <= 0x9fff) ||
-    (code >= 0x3400 && code <= 0x4dbf) ||
-    (code >= 0x3000 && code <= 0x30ff) ||
-    (code >= 0xff00 && code <= 0xffef) ||
-    (code >= 0xf900 && code <= 0xfaff)
-  ) return 2;
-  return 1;
-}
-
-function textWidth(text: string): number {
-  let width = 0;
-  for (const char of text) width += charWidth(char);
-  return width;
-}
-
-function wrapText(text: string, maxWidth: number): string[] {
-  const lines: string[] = [];
-  for (const paragraph of text.split("\n")) {
-    if (!paragraph) { lines.push(""); continue; }
-    // Word-aware: break at the last space before the limit. If no space
-    // exists (long paths/URLs), break at the character limit.
-    let current = "";
-    let width = 0;
-    let lastSpace = -1; // width position of the last space in `current`
-
-    for (const char of paragraph) {
-      const w = charWidth(char);
-      if (width + w > maxWidth) {
-        if (lastSpace > 0 && lastSpace > maxWidth * 0.3) {
-          // Break at the last word boundary.
-          lines.push(current.slice(0, lastSpace).trimEnd());
-          current = current.slice(lastSpace + 1) + char;
-          width = textWidth(current);
-        } else {
-          // No good break point (long token) — hard break.
-          lines.push(current);
-          current = char;
-          width = w;
-        }
-        lastSpace = -1;
-        // Recompute lastSpace for the new `current`.
-        for (let i = 0; i < current.length; i++) {
-          if (current[i] === " ") lastSpace = i;
-        }
-      } else {
-        current += char;
-        width += w;
-        if (char === " ") lastSpace = current.length - 1;
-      }
-    }
-    if (current) lines.push(current);
+function historyView(entry: HistoryEntry, columns: number) {
+  if (entry.role === "user") {
+    const lines = wrapText(entry.text ?? "", Math.max(1, columns - 4));
+    return <Box key={entry.id} flexDirection="column" marginBottom={1}><Text bold color="cyan">你</Text>{lines.map((line, index) => <Text key={index}>  {line}</Text>)}</Box>;
   }
-  return lines;
+  if (entry.role === "tool" && entry.tool) return <Box key={entry.id} marginBottom={0}><ToolRow tool={entry.tool} columns={Math.max(16, columns - 2)} /></Box>;
+  if (entry.role === "error") return <Box key={entry.id} flexDirection="column" marginBottom={1}><Text bold color="red">错误</Text><Text color="red">  {entry.text}</Text></Box>;
+  return <Box key={entry.id} flexDirection="column" marginBottom={1}><Text bold color="green">助手</Text><Markdown text={entry.text ?? ""} columns={Math.max(12, columns - 2)} /></Box>;
 }
 
-// ---------------------------------------------------------------------------
-// Message components
-// ---------------------------------------------------------------------------
-
-/** Wraps to the actual terminal width (minus margin), falling back to 80. */
-function terminalWidth(): number {
-  const width = process.stdout.columns ?? 80;
-  // Leave room for the "  " indent on each message line.
-  return Math.max(40, width - 4);
+function terminalEvent(type: string): boolean {
+  return type === "turn.completed" || type === "turn.failed" || type === "turn.cancelled" || type === "turn.timed_out";
 }
 
-function ChatEntryView({ entry }: { entry: ChatEntry }) {
-  const lines = wrapText(entry.text, terminalWidth());
-  switch (entry.role) {
-    case "user":
-      if (!entry.text.trim()) return null;
-      return (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold color="cyan">You:</Text>
-          {lines.map((line, i) => (
-            <Text key={i} color="cyan">  {line}</Text>
-          ))}
-        </Box>
-      );
-    case "assistant":
-      return (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold color="green">  </Text>
-          {lines.map((line, i) => (
-            <Text key={i}>  {line}</Text>
-          ))}
-        </Box>
-      );
-    case "tool":
-      return (
-        <Box marginBottom={1}>
-          <Text dimColor>  ⚙ {entry.text}</Text>
-        </Box>
-      );
-    case "error":
-      return (
-        <Box marginBottom={1}>
-          <Text bold color="red">  ✗ {entry.text}</Text>
-        </Box>
-      );
-  }
+function projectedDetails(event: EventNotification["event"]): ToolDetails | undefined {
+  const detail = event.input_detail;
+  if (!detail) return undefined;
+  return {
+    kind: detail.kind ?? "tool",
+    text: detail.command ?? detail.path ?? detail.old_preview?.text ?? detail.new_preview?.text ?? "",
+    truncated: Boolean(detail.truncated || event.input_summary_truncated),
+    redacted: Boolean(detail.redacted || event.input_summary_redacted),
+  };
 }
 
-// ---------------------------------------------------------------------------
-// Main chat app
-// ---------------------------------------------------------------------------
-
-interface ChatAppProps {
-  client: HarnessClient;
-  sessionId: string;
-}
-
-export function ChatApp({ client, sessionId }: ChatAppProps) {
+export function ChatApp({ client, sessionId, context }: ChatAppProps) {
   const { exit } = useApp();
-
-  const [chat, setChat] = useState<ChatEntry[]>([]);
+  const { columns, rows } = useTerminalSize();
+  const width = Math.max(24, columns);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [input, setInput] = useState("");
-  const [inflight, setInflight] = useState(0);
-  const [queued, setQueued] = useState<QueuedTurn[]>([]);
-  const [toolStatus, setToolStatus] = useState<string | null>(null);
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [activeTools, setActiveTools] = useState<Map<string, ActiveTool>>(new Map());
   const [approval, setApproval] = useState<PendingApproval | null>(null);
-  const [lastToolName, setLastToolName] = useState<string>("");
-  const [lastInputSummary, setLastInputSummary] = useState<string>("");
-  const [ctrlCCount, setCtrlCCount] = useState(0);
+  const [queued, setQueued] = useState<PendingTurn[]>([]);
+  const [inflight, setInflight] = useState(0);
+  const [stage, setStage] = useState<Stage>("idle");
+  const [approvalPending, setApprovalPending] = useState(false);
 
-  const busy = inflight > 0;
-
-  // Refs for use inside async closures and event handlers.
+  const approvalRef = useRef<PendingApproval | null>(approval);
+  const toolsRef = useRef(activeTools);
   const pendingRef = useRef<PendingTurn[]>([]);
+  const currentTurnRef = useRef<string | null>(null);
   const runningRef = useRef(false);
-  const inputRef = useRef("");
-  const approvalRef = useRef<PendingApproval | null>(null);
-  const lastToolNameRef = useRef("");
-  const lastInputSummaryRef = useRef("");
-  const ctrlCTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  inputRef.current = input;
+  const cancellingRef = useRef(false);
+  const historyIdRef = useRef(0);
+  const inputRef = useRef(input);
   approvalRef.current = approval;
-  lastToolNameRef.current = lastToolName;
-  lastInputSummaryRef.current = lastInputSummary;
+  toolsRef.current = activeTools;
+  inputRef.current = input;
 
-  const addChat = useCallback((entry: ChatEntry) => {
-    setChat((prev) => [...prev, entry]);
+  const addEntry = useCallback((entry: Omit<HistoryEntry, "id">) => {
+    setHistory((previous) => [...previous, { ...entry, id: `entry-${++historyIdRef.current}` }]);
   }, []);
 
-  // -- Event → chat translation ----------------------------------------------
-  useEffect(() => {
-    return client.onEvent((notification: EventNotification) => {
-      const type = notification.event.type;
-      const tool = notification.event.tool ?? "";
-
-      if (type === "tool.requested") {
-        setLastToolName(tool);
-        setLastInputSummary(notification.event.input_summary ?? "");
-        setToolStatus(`${tool}…`);
-      } else if (type === "tool.started") {
-        setToolStatus(`${tool} running…`);
-      } else if (type === "tool.completed") {
-        setToolStatus(null);
-        addChat({ role: "tool", text: `${tool || "tool"} ✓` });
-      } else if (type === "tool.failed") {
-        setToolStatus(null);
-        addChat({ role: "tool", text: `${tool || "tool"} ✗` });
-      } else if (type === "tool.approval.requested") {
-        setToolStatus(null);
-        setApproval({
-          turnId: notification.turn_id ?? "",
-          callId: notification.event.tool_call_id ?? "",
-          toolName: tool || lastToolNameRef.current || "tool",
-          inputSummary: lastInputSummaryRef.current,
-        });
-      } else if (type === "turn.completed" || type === "turn.failed" ||
-                 type === "turn.cancelled" || type === "turn.timed_out") {
-        setToolStatus(null);
-        setApproval(null);
-      }
+  const updateTools = useCallback((callId: string, update: (previous?: ActiveTool) => ActiveTool) => {
+    setActiveTools((previous) => {
+      const next = new Map(previous);
+      next.set(callId, update(previous.get(callId)));
+      toolsRef.current = next;
+      return next;
     });
-  }, [client, addChat]);
+  }, []);
 
-  // -- Turn lifecycle ---------------------------------------------------------
-  // Wait for a single turn to reach a terminal state, then append its text.
+  const finishTools = useCallback((turnId: string) => {
+    const finished = [...toolsRef.current.values()].filter((tool) => tool.turnId === turnId);
+    if (!finished.length) return;
+    setHistory((previous) => [...previous, ...finished.map((tool) => ({ id: `entry-${++historyIdRef.current}`, role: "tool" as const, tool }))]);
+    setActiveTools((previous) => {
+      const next = new Map(previous);
+      for (const tool of finished) next.delete(tool.callId);
+      toolsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  useEffect(() => client.onEvent((notification) => {
+    const event = notification.event;
+    const type = event.type;
+    const callId = event.tool_call_id ?? `event-${notification.seq}`;
+    const turnId = notification.turn_id ?? currentTurnRef.current ?? "";
+    if (type === "tool.requested") {
+      updateTools(callId, (previous) => ({ callId, turnId, name: event.tool ?? previous?.name ?? "tool", summary: event.input_summary ?? previous?.summary ?? "", status: "requested", startedAt: previous?.startedAt, details: projectedDetails(event) ?? previous?.details }));
+      setStage("running");
+      return;
+    }
+    if (type === "tool.started") {
+      updateTools(callId, (previous) => ({ callId, turnId: previous?.turnId ?? turnId, name: previous?.name ?? "tool", summary: previous?.summary ?? "", status: "running", startedAt: previous?.startedAt ?? Date.now(), details: previous?.details }));
+      setStage("running");
+      return;
+    }
+    if (type === "tool.approval.requested") {
+      const tool = toolsRef.current.get(callId);
+      updateTools(callId, (previous) => ({ ...(previous ?? { callId, turnId, name: "tool", summary: "", status: "approval" as const }), status: "approval" }));
+      setApproval({ turnId, callId, toolName: tool?.name ?? "tool", inputSummary: tool?.summary ?? "", details: tool?.details });
+      setStage("approval");
+      return;
+    }
+    if (type === "tool.completed" || type === "tool.failed" || type === "tool.outcome_unknown" || type === "tool.policy_denied") {
+      const status: ToolDisplay["status"] = type === "tool.completed" ? "completed" : type === "tool.policy_denied" ? "denied" : type === "tool.outcome_unknown" ? "unknown" : "failed";
+      updateTools(callId, (previous) => ({ callId, turnId: previous?.turnId ?? turnId, name: previous?.name ?? "tool", summary: previous?.summary ?? "", status, startedAt: previous?.startedAt, finishedAt: Date.now(), details: previous?.details, resultSummary: event.result_summary ? String(event.result_summary.kind ?? "结果已记录") : event.error_summary?.text ?? event.reason }));
+      if (approvalRef.current?.callId === callId) setApproval(null);
+      return;
+    }
+    if (type === "tool.approval.responded" && !event.approved) {
+      updateTools(callId, (previous) => ({ ...(previous ?? { callId, turnId, name: "tool", summary: "", status: "denied" as const }), status: "denied", finishedAt: Date.now() }));
+      return;
+    }
+    if (terminalEvent(type) && approvalRef.current?.turnId === turnId) setApproval(null);
+  }), [client, updateTools]);
+
   const waitForTurn = useCallback(async (turnId: string) => {
     for (;;) {
       let response;
-      try {
-        response = await client.request("turn.wait", {
-          turn_id: turnId,
-          timeout_ms: 300,
-        });
-      } catch (error) {
-        addChat({ role: "error", text: (error as Error).message });
-        return;
-      }
-
+      try { response = await client.request("turn.wait", { turn_id: turnId, session_id: sessionId, timeout_ms: 300 }); }
+      catch (error) { finishTools(turnId); addEntry({ role: "error", text: (error as Error).message }); setStage("idle"); return; }
       if (!response.error) {
-        const text = (response.result as any)?.text ?? "";
-        if (text) addChat({ role: "assistant", text });
+        finishTools(turnId);
+        const text = (response.result as { text?: string } | undefined)?.text ?? "";
+        if (text) addEntry({ role: "assistant", text });
+        setStage("idle");
         return;
       }
-
-      const code = (response.error as any).code;
-      if (code === "turn_pending") continue; // still running
-
-      if (code === "approval_pending") {
-        // The approval event notification drives the y/n prompt; poll
-        // slowly and let approval.respond finish the turn.
-        await new Promise((resolve) => setTimeout(resolve, 500));
+      const code = response.error.code;
+      if (code === "turn_pending") {
+        setStage(toolsRef.current.size ? "running" : "waiting");
+        // The real server holds turn.wait open for the requested timeout;
+        // demo clients may return immediately, so keep polling bounded.
+        await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
       }
-
-      if (code === "turn_cancelled") {
-        addChat({ role: "assistant", text: "(cancelled)" });
-        return;
+      if (code === "approval_pending") {
+        setStage("approval");
+        // The event stream and turn.wait are independent protocol surfaces.
+        // If the approval notification was delayed or dropped, wait() still
+        // gives us a trustworthy indication that input must be paused. Build
+        // the panel from the correlated active tool instead of leaving an
+        // empty composer on screen.
+        if (!approvalRef.current) {
+          const pendingTool = [...toolsRef.current.values()].find((tool) =>
+            tool.turnId === turnId && (tool.status === "requested" || tool.status === "running" || tool.status === "approval"),
+          );
+          if (pendingTool) {
+            setApproval({
+              turnId,
+              callId: pendingTool.callId,
+              toolName: pendingTool.name,
+              inputSummary: pendingTool.summary,
+              details: pendingTool.details,
+            });
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        continue;
       }
-
-      addChat({ role: "error", text: (response.error as any).message });
+      finishTools(turnId);
+      if (code === "turn_cancelled") { addEntry({ role: "error", text: "本次执行已取消" }); setStage("cancelled"); }
+      else { addEntry({ role: "error", text: response.error.message }); setStage("idle"); }
       return;
     }
-  }, [client, addChat]);
+  }, [addEntry, client, finishTools, sessionId]);
 
-  // The server runs turns FIFO, so process our submissions in the same
-  // order. Otherwise a queued "You:" line could appear before the
-  // assistant reply of the turn that is still running.
   const pump = useCallback(async () => {
     if (runningRef.current) return;
     runningRef.current = true;
     try {
-      while (pendingRef.current.length > 0) {
+      while (pendingRef.current.length) {
         const item = pendingRef.current.shift()!;
-        if (item.wasQueued) {
-          setQueued((prev) => prev.filter((q) => q.turnId !== item.turnId));
-          addChat({ role: "user", text: item.text });
-        }
+        currentTurnRef.current = item.turnId;
+        if (item.wasQueued) { setQueued((previous) => previous.filter((turn) => turn.turnId !== item.turnId)); addEntry({ role: "user", text: item.text }); }
         await waitForTurn(item.turnId);
-        setInflight((n) => Math.max(0, n - 1));
+        currentTurnRef.current = null;
+        cancellingRef.current = false;
+        setInflight((count) => Math.max(0, count - 1));
       }
-    } finally {
-      runningRef.current = false;
-    }
-  }, [addChat, waitForTurn]);
+    } finally { runningRef.current = false; currentTurnRef.current = null; }
+  }, [addEntry, waitForTurn]);
 
-  // Submit an input. If a turn is already running, the server queues it
-  // durably and reports `queued: true`; the line shows under "排队中" until
-  // the pump reaches it.
   const sendPrompt = useCallback(async (prompt: string) => {
-    const userText = prompt.trim();
-    if (!userText) return;
-    setInput("");
-
-    let startResponse;
-    try {
-      startResponse = await client.request("turn.start", {
-        prompt: userText,
-        session_id: sessionId,
-      });
-    } catch (error) {
-      addChat({ role: "error", text: (error as Error).message });
-      return;
-    }
-
-    if (startResponse.error) {
-      addChat({ role: "error", text: (startResponse.error as any).message });
-      return;
-    }
-
-    const result = startResponse.result as any;
-    const turnId: string | undefined = result?.turn_id;
-    if (!turnId) {
-      addChat({ role: "error", text: "no turn id returned" });
-      return;
-    }
-
-    const wasQueued = Boolean(result?.queued);
-    if (wasQueued) {
-      setQueued((prev) => [...prev, { turnId, text: userText }]);
-    } else {
-      addChat({ role: "user", text: userText });
-    }
-
-    pendingRef.current.push({ turnId, text: userText, wasQueued });
-    setInflight((n) => n + 1);
+    if (!prompt.trim()) return false;
+    setStage("submitting");
+    let response;
+    try { response = await client.request("turn.start", { prompt, session_id: sessionId }); }
+    catch (error) { addEntry({ role: "error", text: (error as Error).message }); setStage(inflight ? "waiting" : "idle"); return false; }
+    if (response.error) { addEntry({ role: "error", text: response.error.message }); setStage(inflight ? "waiting" : "idle"); return false; }
+    const result = response.result as { turn_id?: string; queued?: boolean } | undefined;
+    if (!result?.turn_id) { addEntry({ role: "error", text: "服务端没有返回 turn id" }); setStage("idle"); return false; }
+    setInputHistory((previous) => addHistory(previous, prompt));
+    // Clear only the submitted draft. If the user started editing while the
+    // request was being accepted, preserve that newer draft in the composer.
+    if (inputRef.current === prompt) setInput("");
+    const item: PendingTurn = { turnId: result.turn_id, text: prompt, wasQueued: Boolean(result.queued) };
+    if (item.wasQueued) setQueued((previous) => [...previous, item]); else addEntry({ role: "user", text: prompt });
+    pendingRef.current.push(item);
+    setInflight((count) => count + 1);
     void pump();
-  }, [client, sessionId, addChat, pump]);
+    return true;
+  }, [addEntry, client, inflight, pump, sessionId]);
 
-  // -- Approval handling --------------------------------------------------------
   const handleApproval = useCallback(async (approved: boolean) => {
     const pending = approvalRef.current;
     if (!pending) return;
-
-    setApproval(null);
-    addChat({
-      role: "tool",
-      text: approved ? `${pending.toolName} approved ✓` : `${pending.toolName} denied ✗`,
-    });
-
+    setApprovalPending(true);
     try {
-      const response = await client.request("approval.respond", {
-        turn_id: pending.turnId,
-        call_id: pending.callId,
-        approved,
-        session_id: sessionId,
-      });
+      const response = await client.request("approval.respond", { session_id: sessionId, turn_id: pending.turnId, call_id: pending.callId, approved });
+      if (!response.error || response.error.code === "approval_pending") setApproval(null);
+      else addEntry({ role: "error", text: response.error.message });
+    } catch (error) { addEntry({ role: "error", text: (error as Error).message }); }
+    finally { setApprovalPending(false); }
+  }, [addEntry, client, sessionId]);
 
-      if (response.error) {
-        const code = (response.error as any).code;
-        if (code === "approval_pending") {
-          // Not an error: the approved tool ran and the model's next tool
-          // call also needs approval. The event notification will set up
-          // the next approval prompt — nothing to do here.
-          return;
-        }
-        addChat({ role: "error", text: (response.error as any).message });
-        return;
-      }
-
-      // If approved and completed, the turn pump's wait loop adds the
-      // assistant text; adding it here too would duplicate it. A denial
-      // cancels the turn, which the same loop reports as "(cancelled)".
-    } catch (error) {
-      addChat({ role: "error", text: (error as Error).message });
-    }
-  }, [client, sessionId, addChat]);
-
-  // -- Input handling -----------------------------------------------------------
   useInput((char, key) => {
-    // Ctrl-C: exit on double press.
+    if (key.ctrl && char === "d") { exit(); return; }
     if (key.ctrl && char === "c") {
-      const count = ctrlCCount + 1;
-      setCtrlCCount(count);
-
-      if (count >= 2) {
-        exit();
-        return;
-      }
-
-      if (ctrlCTimerRef.current) clearTimeout(ctrlCTimerRef.current);
-      ctrlCTimerRef.current = setTimeout(() => setCtrlCCount(0), 2000);
-      return;
+      const turnId = currentTurnRef.current;
+      if (!turnId || cancellingRef.current) { setStage("idle"); return; }
+      cancellingRef.current = true;
+      setStage("cancelling");
+      void client.request("turn.cancel", { session_id: sessionId, turn_id: turnId }).catch((error) => { cancellingRef.current = false; addEntry({ role: "error", text: (error as Error).message }); setStage("waiting"); });
     }
-
-    if (key.ctrl && char === "d") {
-      exit();
-      return;
-    }
-
-    // Approval mode: intercept y/n.
-    if (approvalRef.current) {
-      if (char === "y" || char === "Y") { handleApproval(true); return; }
-      if (char === "n" || char === "N") { handleApproval(false); return; }
-      return; // ignore other keys
-    }
-
-    // Normal input.
-    if (key.return) {
-      sendPrompt(inputRef.current);
-      return;
-    }
-    if (key.delete || key.backspace) {
-      setInput((prev) => prev.slice(0, -1));
-      return;
-    }
-    if (key.ctrl || key.meta || key.escape) return;
-    if (char) setInput((prev) => prev + char);
   });
 
-  // -- Render ---------------------------------------------------------------------
-  const visibleChat = chat.slice(-20);
+  const active = [...activeTools.values()];
+  const busy = inflight > 0;
+  const status = stage === "submitting" ? "正在提交……" : stage === "waiting" ? "等待模型响应" : stage === "running" ? `正在执行 ${active.at(-1)?.name ?? "工具"}` : stage === "approval" ? "等待你批准" : stage === "cancelling" ? "正在取消……" : stage === "cancelled" ? "已取消" : "就绪";
+  const environment = contextLabel(context);
 
-  return (
-    <Box flexDirection="column">
-      {/* Chat history */}
-      <Box flexDirection="column">
-        {visibleChat.map((entry, i) => (
-          <ChatEntryView key={i} entry={entry} />
-        ))}
-
-        {/* Active tool indicator */}
-        {toolStatus && (
-          <Box marginBottom={1}>
-            <Text dimColor>  ⚙ {toolStatus}</Text>
-          </Box>
-        )}
-
-        {/* Approval prompt */}
-        {approval && (
-          <Box flexDirection="column" marginBottom={1}>
-            <Text bold color="yellow">
-              ︙ {approval.toolName} — approve? [y/n]
-            </Text>
-            {approval.inputSummary && (
-              <Text color="yellow">  {approval.inputSummary}</Text>
-            )}
-          </Box>
-        )}
-
-        {/* Typing indicator */}
-        {busy && !toolStatus && !approval && (
-          <Box marginBottom={1}>
-            <Text dimColor>  thinking…</Text>
-          </Box>
-        )}
-      </Box>
-
-      {/* Queued inputs: accepted by the server, not started yet */}
-      {queued.map((q) => (
-        <Box key={q.turnId} marginBottom={0}>
-          <Text dimColor>  ⏳ 排队中：{q.text}</Text>
-        </Box>
-      ))}
-
-      {/* Input box */}
-      <Box borderStyle="round" borderColor={busy ? "yellow" : "blue"} paddingX={1} marginTop={1}>
-        <Text bold color={busy ? "yellow" : "blue"}>{busy ? "…" : "❯"}</Text>
-        <Text> {input}</Text>
-        {!approval && <Text color="blue">█</Text>}
-      </Box>
-
-      {/* Hints */}
-      <Box marginTop={1}>
-        <Text dimColor>
-          {"  "}
-          {approval
-            ? "y approve · n deny"
-            : busy
-              ? "Enter 排队 · Ctrl-C ×2 exit"
-              : "Enter send · Ctrl-D exit"}
-        </Text>
-      </Box>
-    </Box>
-  );
+  return <Box flexDirection="column" width={width}>
+    <Text bold>mini-harness · {context?.provider ?? "mock"}</Text>
+    <Text dimColor>{context?.workspace ?? "workspace 未获取"} · session {sessionId.slice(0, 8)}</Text>
+    <Text dimColor>{status} · {environment}</Text>
+    <Static items={history}>{(entry) => historyView(entry, width)}</Static>
+    {active.length > 0 && <Box flexDirection="column" marginTop={1} marginBottom={1}><Text bold>执行过程</Text>{active.map((tool) => <ToolRow key={tool.callId} tool={tool} columns={Math.max(16, width - 2)} />)}</Box>}
+    {approval && <ApprovalPanel key={approval.callId} toolName={approval.toolName} summary={approval.inputSummary} workspace={context?.workspace ?? "未获取"} environment={environment} details={approval.details} onDecision={handleApproval} pending={approvalPending} columns={width} />}
+    {queued.map((turn) => <Text key={turn.turnId} dimColor>⏳ 排队中：{turn.text}</Text>)}
+    <Composer value={input} onChange={setInput} onSubmit={sendPrompt} history={inputHistory} disabled={Boolean(approval) || stage === "approval"} columns={width} rows={Math.min(6, Math.max(2, rows - 8))} />
+    <Text dimColor>Enter 发送 · Alt-Enter 换行 · ↑/↓ 历史 · Ctrl-C 取消当前执行 · Ctrl-D 退出{busy && stage !== "approval" ? " · 当前执行中可继续排队" : ""}</Text>
+  </Box>;
 }
