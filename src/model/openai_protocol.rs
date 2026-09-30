@@ -163,6 +163,7 @@ pub(super) fn make_continuation(
         endpoint: config.endpoint.clone(),
         response_id: Some(response_id.into()),
         reasoning_content: None, // Responses API doesn't use reasoning_content
+        reasoning_history: Vec::new(),
         native_call_ids,
         history_cursor: request.history.len(),
     }
@@ -432,16 +433,18 @@ fn validate_id(id: &str) -> Result<(), ProviderError> {
 pub(super) fn build_cc_messages(
     history: &[HistoryItem],
     native_call_ids: &std::collections::HashMap<ToolCallId, String>,
-    reasoning_content: Option<&str>,
+    reasoning_history: &[Option<String>],
 ) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     let mut pending_assistant: Option<String> = None;
     let mut last_assistant: Option<usize> = None;
-    for item in history {
-        match item {
+    let mut index = 0;
+    while index < history.len() {
+        match &history[index] {
             HistoryItem::User(input) => {
                 flush_assistant(&mut messages, pending_assistant.take(), &mut last_assistant);
                 messages.push(json!({"role": "user", "content": input.0}));
+                index += 1;
             }
             HistoryItem::Assistant(text) => {
                 flush_assistant(
@@ -449,49 +452,87 @@ pub(super) fn build_cc_messages(
                     pending_assistant.replace(text.0.clone()),
                     &mut last_assistant,
                 );
+                index += 1;
             }
-            HistoryItem::Tool {
-                call_id,
-                name,
-                result,
-            } => {
+            HistoryItem::Tool { .. } => {
+                // A single model response can contain multiple tool calls.
+                // The normalized history stores one Tool item per result, so
+                // gather the contiguous run back into one assistant message
+                // with a matching `tool_calls` array.  Emitting one assistant
+                // message per result loses the response boundary and, for
+                // thinking models, leaves all but one message without the
+                // required reasoning_content.
                 let content = pending_assistant
                     .take()
                     .map(Value::String)
                     .unwrap_or(Value::Null);
-                // Prefer the provider-native call id the model actually
-                // emitted; fall back to the runtime id when the continuation
-                // does not know it (fresh sessions, restored logs).
-                let native = native_call_ids
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| call_id.to_string());
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": [{
+                let mut tool_calls = Vec::new();
+                let mut tool_results = Vec::new();
+                while index < history.len() {
+                    let HistoryItem::Tool {
+                        call_id,
+                        name,
+                        result,
+                    } = &history[index]
+                    else {
+                        break;
+                    };
+                    // Prefer the provider-native call id the model actually
+                    // emitted; fall back to the runtime id when the
+                    // continuation does not know it (fresh sessions,
+                    // restored logs).
+                    let native = native_call_ids
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_else(|| call_id.to_string());
+                    tool_calls.push(json!({
                         "id": native,
                         "type": "function",
                         "function": {"name": name.0, "arguments": "{}"},
-                    }],
+                    }));
+                    tool_results.push(json!({
+                        "role": "tool",
+                        "tool_call_id": native,
+                        "content": result.0,
+                    }));
+                    index += 1;
+                }
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
                 }));
                 last_assistant = Some(messages.len() - 1);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": native,
-                    "content": result.0,
-                }));
+                messages.extend(tool_results);
             }
         }
     }
     flush_assistant(&mut messages, pending_assistant, &mut last_assistant);
 
-    // Thinking models (e.g. deepseek-flash) require the reasoning_content of
-    // the most recent assistant reply to be passed back. That reply is the
-    // last assistant message in history, whether it is a tool call or the
-    // final text; earlier assistant turns keep their own (unretained) reasoning.
-    if let (Some(index), Some(reasoning)) = (last_assistant, reasoning_content) {
-        messages[index]["reasoning_content"] = json!(reasoning);
+    // Thinking models (e.g. deepseek-flash) require reasoning_content on
+    // every assistant reply that is replayed. Align the saved response list
+    // from the right because ContextSnapshot may retain only a suffix of the
+    // normalized history. Empty entries are intentional: they keep a later
+    // response's reasoning paired with the correct assistant message.
+    let assistant_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message["role"] == "assistant").then_some(index))
+        .collect::<Vec<_>>();
+    let assistant_offset = assistant_indices
+        .len()
+        .saturating_sub(reasoning_history.len());
+    let reasoning_offset = reasoning_history
+        .len()
+        .saturating_sub(assistant_indices.len());
+    for (index, reasoning) in assistant_indices
+        .into_iter()
+        .skip(assistant_offset)
+        .zip(reasoning_history.iter().skip(reasoning_offset))
+    {
+        if let Some(reasoning) = reasoning {
+            messages[index]["reasoning_content"] = json!(reasoning);
+        }
     }
     messages
 }
@@ -519,11 +560,22 @@ pub(super) fn build_cc_request_body(
     let native_call_ids = continuation
         .map(|c| c.native_call_ids.clone())
         .unwrap_or_default();
-    let reasoning_content = continuation.and_then(|c| c.reasoning_content.as_deref());
+    let reasoning_history = continuation
+        .map(|c| {
+            if c.reasoning_history.is_empty() {
+                c.reasoning_content
+                    .as_ref()
+                    .map(|reasoning| vec![Some(reasoning.clone())])
+                    .unwrap_or_default()
+            } else {
+                c.reasoning_history.clone()
+            }
+        })
+        .unwrap_or_default();
     messages.extend(build_cc_messages(
         &request.history,
         &native_call_ids,
-        reasoning_content,
+        &reasoning_history,
     ));
     let tools = request
         .tools
@@ -598,12 +650,25 @@ pub(super) fn parse_cc_json_response(body: &str) -> Result<ParsedResponse, Provi
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| ProviderError::from("tool call is missing name"))?;
+            // Chat Completions encodes function arguments as a JSON string.
+            // Do not silently turn a missing/null/non-string value into `{}`:
+            // doing so dispatches an invalid call to the tool (for example,
+            // bash then reports that `command` is not a string) and makes the
+            // approval UI show an opaque input.  Reject the provider response
+            // at the protocol boundary instead, where the actual malformed
+            // shape is still clear and no tool side effect can occur.
             let arguments = function
                 .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
+                .ok_or_else(|| ProviderError::from("tool call is missing arguments"))?
+                .as_str()
+                .ok_or_else(|| ProviderError::from("tool call arguments must be a JSON string"))?;
             let input: Value = serde_json::from_str(arguments)
                 .map_err(|_| ProviderError::from("tool call has invalid arguments JSON"))?;
+            if !input.is_object() {
+                return Err(ProviderError::from(
+                    "tool call arguments must be a JSON object",
+                ));
+            }
             calls.push(ParsedToolCall {
                 call: ToolCall {
                     call_id: ToolCallId::new(),
@@ -630,6 +695,7 @@ pub(super) fn parse_cc_json_response(body: &str) -> Result<ParsedResponse, Provi
 
 pub(super) fn parse_cc_stream_response(body: &str) -> Result<ParsedResponse, ProviderError> {
     let mut text = String::new();
+    let mut reasoning_content = String::new();
     let mut tool_names: Vec<String> = Vec::new();
     let mut tool_arguments: Vec<String> = Vec::new();
     let mut tool_ids: Vec<Option<String>> = Vec::new();
@@ -660,6 +726,9 @@ pub(super) fn parse_cc_stream_response(body: &str) -> Result<ParsedResponse, Pro
         };
         if let Some(chunk) = delta.get("content").and_then(Value::as_str) {
             text.push_str(chunk);
+        }
+        if let Some(chunk) = delta.get("reasoning_content").and_then(Value::as_str) {
+            reasoning_content.push_str(chunk);
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for item in tool_calls {
@@ -694,6 +763,11 @@ pub(super) fn parse_cc_stream_response(body: &str) -> Result<ParsedResponse, Pro
         }
         let input: Value = serde_json::from_str(&arguments)
             .map_err(|_| ProviderError::from("streamed tool call has invalid arguments"))?;
+        if !input.is_object() {
+            return Err(ProviderError::from(
+                "streamed tool call arguments must be a JSON object",
+            ));
+        }
         calls.push(ParsedToolCall {
             call: ToolCall {
                 call_id: ToolCallId::new(),
@@ -713,7 +787,7 @@ pub(super) fn parse_cc_stream_response(body: &str) -> Result<ParsedResponse, Pro
         text,
         calls,
         usage: None,
-        reasoning_content: None, // TODO: accumulate reasoning deltas in streaming
+        reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
     })
 }
 
@@ -734,12 +808,57 @@ pub(super) fn make_cc_continuation(
     request: &ModelRequest,
     config: &OpenAiProviderConfig,
     calls: &[ParsedToolCall],
+    previous: Option<&ProviderContinuation>,
     reasoning_content: Option<&str>,
 ) -> ProviderContinuation {
-    let native_call_ids = calls
-        .iter()
-        .map(|call| (call.call.call_id, call.native_call_id.clone()))
-        .collect();
+    // Keep IDs from earlier rounds as well.  If a Chat Completions turn is
+    // later cancelled or fails, its normalized history is replayed from the
+    // beginning and older role=tool messages still need their provider-native
+    // IDs.  Replacing this map with only the latest batch would make those
+    // messages fall back to runtime UUIDs.
+    let mut native_call_ids = previous
+        .map(|continuation| continuation.native_call_ids.clone())
+        .unwrap_or_default();
+    native_call_ids.extend(
+        calls
+            .iter()
+            .map(|call| (call.call.call_id, call.native_call_id.clone())),
+    );
+    const MAX_NATIVE_CALL_IDS: usize = 32;
+    if native_call_ids.len() > MAX_NATIVE_CALL_IDS {
+        let current_ids = calls
+            .iter()
+            .map(|call| call.call.call_id)
+            .collect::<HashSet<_>>();
+        while native_call_ids.len() > MAX_NATIVE_CALL_IDS {
+            let Some(old_id) = native_call_ids
+                .keys()
+                .copied()
+                .find(|id| !current_ids.contains(id))
+            else {
+                break;
+            };
+            native_call_ids.remove(&old_id);
+        }
+    }
+    let mut reasoning_history = previous
+        .map(|continuation| continuation.reasoning_history.clone())
+        .unwrap_or_default();
+    // Checkpoints created before reasoning_history existed still carry the
+    // latest value in reasoning_content. Preserve it as the first known slot.
+    if reasoning_history.is_empty() {
+        if let Some(previous) =
+            previous.and_then(|continuation| continuation.reasoning_content.as_ref())
+        {
+            reasoning_history.push(Some(previous.clone()));
+        }
+    }
+    reasoning_history.push(reasoning_content.map(str::to_owned));
+    const MAX_REASONING_HISTORY: usize = 64;
+    if reasoning_history.len() > MAX_REASONING_HISTORY {
+        let drop = reasoning_history.len() - MAX_REASONING_HISTORY;
+        reasoning_history.drain(..drop);
+    }
     ProviderContinuation {
         provider: "openai".into(),
         model: config.model.clone(),
@@ -748,6 +867,7 @@ pub(super) fn make_cc_continuation(
         native_call_ids,
         history_cursor: request.history.len(),
         reasoning_content: reasoning_content.map(str::to_owned),
+        reasoning_history,
     }
 }
 
@@ -792,7 +912,7 @@ mod tests {
             HistoryItem::User(UserInput("hi".into())),
             HistoryItem::Assistant(ModelText("hello".into())),
         ];
-        let messages = build_cc_messages(&history, &HashMap::new(), Some("thinking"));
+        let messages = build_cc_messages(&history, &HashMap::new(), &[Some("thinking".into())]);
         assert_eq!(messages.last().unwrap()["reasoning_content"], "thinking");
     }
 
@@ -807,11 +927,200 @@ mod tests {
                 result: ToolResult("x".into()),
             },
         ];
-        let messages = build_cc_messages(&history, &HashMap::new(), Some("thinking"));
+        let messages = build_cc_messages(&history, &HashMap::new(), &[Some("thinking".into())]);
         let assistant = messages
             .iter()
             .find(|message| message.get("tool_calls").is_some())
             .expect("synthesized tool-call assistant message");
         assert_eq!(assistant["reasoning_content"], "thinking");
+    }
+
+    #[test]
+    fn cc_replays_each_reasoning_value_for_replayed_assistant_messages() {
+        let history = vec![
+            HistoryItem::User(UserInput("read it".into())),
+            HistoryItem::Assistant(ModelText("tool call: read".into())),
+            HistoryItem::Tool {
+                call_id: ToolCallId::new(),
+                name: ToolName("read".into()),
+                result: ToolResult("contents".into()),
+            },
+            HistoryItem::Assistant(ModelText("done".into())),
+            HistoryItem::User(UserInput("continue".into())),
+        ];
+        let messages = build_cc_messages(
+            &history,
+            &HashMap::new(),
+            &[
+                Some("tool reasoning".into()),
+                Some("final reasoning".into()),
+            ],
+        );
+        let assistants = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0]["reasoning_content"], "tool reasoning");
+        assert_eq!(assistants[1]["reasoning_content"], "final reasoning");
+    }
+
+    #[test]
+    fn cc_aligns_legacy_single_reasoning_value_to_the_latest_assistant() {
+        let history = vec![
+            HistoryItem::User(UserInput("first".into())),
+            HistoryItem::Assistant(ModelText("first answer".into())),
+            HistoryItem::User(UserInput("second".into())),
+            HistoryItem::Assistant(ModelText("second answer".into())),
+        ];
+        let messages = build_cc_messages(
+            &history,
+            &HashMap::new(),
+            &[Some("latest reasoning".into())],
+        );
+        let assistants = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect::<Vec<_>>();
+        assert!(assistants[0].get("reasoning_content").is_none());
+        assert_eq!(assistants[1]["reasoning_content"], "latest reasoning");
+    }
+
+    #[test]
+    fn cc_aligns_a_history_suffix_to_the_latest_reasoning_values() {
+        let history = vec![
+            HistoryItem::User(UserInput("latest".into())),
+            HistoryItem::Assistant(ModelText("latest answer".into())),
+        ];
+        let messages = build_cc_messages(
+            &history,
+            &HashMap::new(),
+            &[
+                Some("old reasoning".into()),
+                Some("latest reasoning".into()),
+            ],
+        );
+        assert_eq!(messages[1]["reasoning_content"], "latest reasoning");
+    }
+
+    #[test]
+    fn cc_groups_a_tool_batch_before_aligning_reasoning() {
+        let first_call = ToolCallId::new();
+        let second_call = ToolCallId::new();
+        let history = vec![
+            HistoryItem::User(UserInput("inspect both files".into())),
+            HistoryItem::Assistant(ModelText("tool calls: read, read".into())),
+            HistoryItem::Tool {
+                call_id: first_call,
+                name: ToolName("read".into()),
+                result: ToolResult("first".into()),
+            },
+            HistoryItem::Tool {
+                call_id: second_call,
+                name: ToolName("read".into()),
+                result: ToolResult("second".into()),
+            },
+        ];
+        let messages =
+            build_cc_messages(&history, &HashMap::new(), &[Some("batch reasoning".into())]);
+        let assistants = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(assistants[0]["reasoning_content"], "batch reasoning");
+        let tool_messages = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(tool_messages.len(), 2);
+    }
+
+    #[test]
+    fn cc_continuation_retains_native_ids_from_earlier_rounds() {
+        let old_call = ToolCallId::new();
+        let new_call = ToolCallId::new();
+        let previous = ProviderContinuation {
+            provider: "openai".into(),
+            response_id: None,
+            model: "deepseek-flash".into(),
+            endpoint: "https://api.deepseek.com/chat/completions".into(),
+            native_call_ids: [(old_call, "call_old".into())].into_iter().collect(),
+            history_cursor: 0,
+            reasoning_content: Some("old reasoning".into()),
+            reasoning_history: vec![Some("old reasoning".into())],
+        };
+        let request = ModelRequest::new(Vec::new(), Vec::new());
+        let parsed = ParsedToolCall {
+            call: ToolCall {
+                call_id: new_call,
+                name: ToolName("read".into()),
+                input: json!({}),
+            },
+            native_call_id: "call_new".into(),
+        };
+        let continuation = make_cc_continuation(
+            &request,
+            &OpenAiProviderConfig::new("deepseek-flash", "sk-test"),
+            &[parsed],
+            Some(&previous),
+            Some("new reasoning"),
+        );
+        assert_eq!(
+            continuation.native_call_ids.get(&old_call).unwrap(),
+            "call_old"
+        );
+        assert_eq!(
+            continuation.native_call_ids.get(&new_call).unwrap(),
+            "call_new"
+        );
+    }
+
+    #[test]
+    fn cc_stream_accumulates_reasoning_deltas() {
+        let response = parse_cc_stream_response(
+            &("data: {\"id\":\"cc_reasoning\",\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n"
+                .to_owned()
+                + "data: {\"id\":\"cc_reasoning\",\"choices\":[{\"delta\":{\"reasoning_content\":\" more\",\"content\":\"answer\"}}]}\n\n"
+                + "data: [DONE]\n\n"),
+        )
+        .unwrap();
+        assert_eq!(response.reasoning_content.as_deref(), Some("think more"));
+        assert_eq!(response.text, "answer");
+    }
+
+    #[test]
+    fn cc_rejects_missing_tool_arguments_instead_of_dispatching_empty_input() {
+        let body = json!({
+            "id": "cc_missing_args",
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash"}
+            }]}}]
+        });
+        let error = match parse_cc_json_response(&body.to_string()) {
+            Ok(_) => panic!("missing arguments unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing arguments"));
+    }
+
+    #[test]
+    fn cc_rejects_non_object_tool_arguments_before_runtime_dispatch() {
+        let body = json!({
+            "id": "cc_array_args",
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "[\"echo hi\"]"}
+            }]}}]
+        });
+        let error = match parse_cc_json_response(&body.to_string()) {
+            Ok(_) => panic!("array arguments unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be a JSON object"));
     }
 }

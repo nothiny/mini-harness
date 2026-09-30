@@ -118,5 +118,6 @@ fn mock_continuation<'a>(
             .collect(),
         history_cursor,
         reasoning_content: None,
+        reasoning_history: Vec::new(),
     }
 }

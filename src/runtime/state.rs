@@ -24,6 +24,13 @@ pub struct ProviderContinuation {
     /// checkpoints/logs readable.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Reasoning for each assistant response in order.  DeepSeek requires
+    /// `reasoning_content` on every assistant message it receives in thinking
+    /// mode, including earlier assistant messages that are replayed around a
+    /// tool call.  The optional entries preserve alignment when a response
+    /// did not contain reasoning content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_history: Vec<Option<String>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SessionStatus {

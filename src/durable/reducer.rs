@@ -34,6 +34,30 @@ fn push_history(state: &mut SessionState, item: HistoryItem) -> Result<(), Harne
     Ok(())
 }
 
+/// Ends the provider cursor for a failed/cancelled turn without discarding
+/// reasoning metadata that a Chat Completions thinking model requires when
+/// the normalized assistant history is replayed on the next user turn.
+///
+/// Responses-style cursors must not survive a terminal turn: they refer to
+/// an incomplete provider exchange. The reasoning sequence and native ids
+/// are independent replay metadata, so retain them with a replay-only
+/// continuation. This keeps the next request from reusing a stale response
+/// id while still satisfying DeepSeek's replay contract for prior tool
+/// messages.
+fn reset_provider_cursor(state: &mut SessionState) {
+    let Some(mut continuation) = state.provider_continuation.take() else {
+        return;
+    };
+    let has_reasoning = continuation.reasoning_content.is_some()
+        || continuation.reasoning_history.iter().any(Option::is_some);
+    if !has_reasoning {
+        return;
+    }
+    continuation.response_id = None;
+    continuation.history_cursor = 0;
+    state.provider_continuation = Some(continuation);
+}
+
 pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessError> {
     if event.session_id != state.session_id {
         return Err(HarnessError::InvariantViolation(
@@ -407,9 +431,10 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             state.active_turn = None;
             state.status = SessionStatus::Failed;
             // A failed turn cannot safely resume the provider cursor on a
-            // subsequent user input.  Continuations are scoped to one
-            // successful turn and must not leak into recovery sampling.
-            state.provider_continuation = None;
+            // subsequent user input. Preserve replayable reasoning and native
+            // tool ids, while reset_provider_cursor removes the response id
+            // that belongs to the incomplete exchange.
+            reset_provider_cursor(state);
             Ok(())
         }
         EventPayload::TurnCancelRequested => {
@@ -421,7 +446,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             turn.status = TurnStatus::Cancelled;
             state.active_turn = None;
             state.status = SessionStatus::Idle;
-            state.provider_continuation = None;
+            reset_provider_cursor(state);
             Ok(())
         }
         EventPayload::TurnTimedOut => {
@@ -429,7 +454,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             turn.status = TurnStatus::TimedOut;
             state.active_turn = None;
             state.status = SessionStatus::Idle;
-            state.provider_continuation = None;
+            reset_provider_cursor(state);
             Ok(())
         }
         _ => Err(HarnessError::InvariantViolation(

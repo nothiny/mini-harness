@@ -54,6 +54,16 @@ pub struct ToolContext<'a> {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+
+    /// Performs cheap, side-effect-free validation before policy approval or
+    /// execution. Implementations can use this to reject malformed model
+    /// arguments without asking the user to approve a call that can never
+    /// run. Runtime execution must still validate again because tool inputs
+    /// can come from restored durable state.
+    fn validate_input(&self, _input: &JsonSchema) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,

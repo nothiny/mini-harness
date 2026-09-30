@@ -1,5 +1,6 @@
 use mini_harness::{
     durable::{EventPayload, EventStore, InMemoryEventStore},
+    error::HarnessError,
     executor::LocalExecutor,
     model::{
         ModelProvider, ModelRequest, ModelResponse, OpenAiProvider, OpenAiProviderConfig, WireStyle,
@@ -8,7 +9,7 @@ use mini_harness::{
     runtime::{
         HistoryItem, ModelText, ProviderContinuation, ToolCallId, ToolName, ToolResult, UserInput,
     },
-    tools::{ReadTool, RiskClass, ToolRegistry, ToolSpec},
+    tools::{BashTool, ReadTool, RiskClass, ToolRegistry, ToolSpec},
 };
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
@@ -292,6 +293,7 @@ async fn openai_replays_history_when_continuation_configuration_changes() {
             native_call_ids: Default::default(),
             history_cursor: 1,
             reasoning_content: None,
+            reasoning_history: Vec::new(),
         }),
     );
     let completion = provider
@@ -550,6 +552,8 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
             "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"},
         })],
     );
+    let mut first = first;
+    first["choices"][0]["message"]["reasoning_content"] = json!("tool reasoning");
     let second = cc_body("cc_final", Some("all done"), &[]);
     let (endpoint, requests, server) = spawn_server(vec![
         ResponseFixture {
@@ -606,6 +610,145 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
         has_tool_roundtrip,
         "follow-up must carry the assistant tool_calls + role:tool pair: {messages:?}"
     );
+    let tool_assistant = messages
+        .iter()
+        .find(|message| message["tool_calls"].is_array())
+        .expect("follow-up must carry the tool-call assistant message");
+    assert_eq!(tool_assistant["reasoning_content"], "tool reasoning");
+}
+
+#[tokio::test]
+async fn deepseek_replays_reasoning_after_a_failed_tool_turn() {
+    let mut first = cc_body(
+        "cc_failed_tool",
+        None,
+        &[json!({
+            "id": "call_bad_bash",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":5}"},
+        })],
+    );
+    first["choices"][0]["message"]["reasoning_content"] = json!("reason before failure");
+    let second = cc_body("cc_after_failure", Some("recovered"), &[]);
+    let (endpoint, requests, server) = spawn_server(vec![
+        ResponseFixture {
+            status: 200,
+            content_type: "application/json",
+            headers: "",
+            body: first.to_string(),
+        },
+        ResponseFixture {
+            status: 200,
+            content_type: "application/json",
+            headers: "",
+            body: second.to_string(),
+        },
+    ])
+    .await;
+    let provider = Arc::new(
+        OpenAiProvider::from_config(
+            OpenAiProviderConfig::new("deepseek-flash", "sk-test")
+                .with_endpoint(endpoint)
+                .with_wire_style(WireStyle::ChatCompletions)
+                .with_max_retries(0),
+        )
+        .unwrap(),
+    );
+    let directory = tempdir().unwrap();
+    let mut registry = ToolRegistry::default();
+    registry.register(BashTool::default()).unwrap();
+    let store = Arc::new(InMemoryEventStore::default());
+    let mut session = Session::new(
+        provider,
+        Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
+        Arc::new(registry),
+        Arc::clone(&store),
+    );
+
+    // The malformed command is rejected before policy approval. It must not
+    // consume a user approval just to discover that the tool cannot run.
+    let failed = session.start_turn("run it".into()).await.unwrap_err();
+    assert!(matches!(failed, HarnessError::Tool(_)));
+    let events = store
+        .read_from(mini_harness::runtime::EventSeq(1))
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::ToolApprovalRequested { .. }))
+    );
+
+    let (_, text) = session.start_turn("retry".into()).await.unwrap();
+    assert_eq!(text, "recovered");
+    server.await.unwrap();
+
+    let requests = requests.lock().await;
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant["reasoning_content"], "reason before failure");
+}
+
+#[tokio::test]
+async fn deepseek_replays_reasoning_across_turns() {
+    let first = json!({
+        "id": "cc_reasoning_1",
+        "choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "content": "first answer",
+            "reasoning_content": "first hidden reasoning"
+        }, "finish_reason": "stop"}]
+    });
+    let second = cc_body("cc_reasoning_2", Some("second answer"), &[]);
+    let (endpoint, requests, server) = spawn_server(vec![
+        ResponseFixture {
+            status: 200,
+            content_type: "application/json",
+            headers: "",
+            body: first.to_string(),
+        },
+        ResponseFixture {
+            status: 200,
+            content_type: "application/json",
+            headers: "",
+            body: second.to_string(),
+        },
+    ])
+    .await;
+    let provider = Arc::new(
+        OpenAiProvider::from_config(
+            OpenAiProviderConfig::new("deepseek-flash", "sk-test")
+                .with_endpoint(endpoint)
+                .with_wire_style(WireStyle::ChatCompletions)
+                .with_max_retries(0),
+        )
+        .unwrap(),
+    );
+    let directory = tempdir().unwrap();
+    let mut session = Session::new(
+        provider,
+        Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
+        Arc::new(ToolRegistry::default()),
+        Arc::new(InMemoryEventStore::default()),
+    );
+
+    let (_, first_text) = session.start_turn("first".into()).await.unwrap();
+    assert_eq!(first_text, "first answer");
+    let (_, second_text) = session.start_turn("second".into()).await.unwrap();
+    assert_eq!(second_text, "second answer");
+    server.await.unwrap();
+
+    let requests = requests.lock().await;
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant["content"], "first answer");
+    assert_eq!(assistant["reasoning_content"], "first hidden reasoning");
 }
 
 #[tokio::test]

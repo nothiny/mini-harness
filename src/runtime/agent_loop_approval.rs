@@ -66,6 +66,24 @@ where
             .tools
             .lookup(&tool_name.0)
             .map_err(|error| HarnessError::Tool(error.to_string().into()))?;
+        if let Err(error) = tool.validate_input(&input) {
+            self.append(
+                Some(turn),
+                EventPayload::ToolFailed {
+                    call_id,
+                    error: error.clone().into(),
+                },
+            )
+            .await?;
+            self.append(
+                Some(turn),
+                EventPayload::TurnFailed {
+                    error: error.clone(),
+                },
+            )
+            .await?;
+            return Err(HarnessError::Tool(error.into()));
+        }
         let execution_id = ExecutionId::new();
         self.append(
             Some(turn),

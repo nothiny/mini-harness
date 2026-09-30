@@ -606,6 +606,24 @@ where
                         return Err(HarnessError::Tool(message.into()));
                     }
                 };
+                if let Err(error) = tool.validate_input(&call_input) {
+                    self.append(
+                        Some(turn),
+                        EventPayload::ToolFailed {
+                            call_id,
+                            error: error.clone().into(),
+                        },
+                    )
+                    .await?;
+                    self.append(
+                        Some(turn),
+                        EventPayload::TurnFailed {
+                            error: error.clone(),
+                        },
+                    )
+                    .await?;
+                    return Err(HarnessError::Tool(error.into()));
+                }
                 let workspace = self.executor.workspace_root();
                 match self
                     .policy

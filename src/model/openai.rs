@@ -308,6 +308,7 @@ impl OpenAiProvider {
                             &request,
                             &self.config,
                             &parsed.calls,
+                            request.continuation.as_ref(),
                             parsed.reasoning_content.as_deref(),
                         ),
                     };

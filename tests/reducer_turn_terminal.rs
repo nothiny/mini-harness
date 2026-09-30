@@ -2,8 +2,8 @@ use mini_harness::{
     durable::{Event, EventPayload, reduce},
     error::ToolError,
     runtime::{
-        EventSeq, ExecutionId, HistoryItem, ModelText, SessionId, SessionState, SessionStatus,
-        ToolCallId, ToolName, TurnId, UserInput,
+        EventSeq, ExecutionId, HistoryItem, ModelText, ProviderContinuation, SessionId,
+        SessionState, SessionStatus, ToolCallId, ToolName, TurnId, UserInput,
     },
 };
 
@@ -73,6 +73,23 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
             session,
             Some(turn),
             4,
+            EventPayload::ProviderContinuationUpdated {
+                continuation: Some(ProviderContinuation {
+                    provider: "openai".into(),
+                    response_id: Some("resp-incomplete".into()),
+                    model: "deepseek-flash".into(),
+                    endpoint: "https://api.deepseek.com/chat/completions".into(),
+                    native_call_ids: [(call, "native-call".into())].into_iter().collect(),
+                    history_cursor: 1,
+                    reasoning_content: Some("hidden reasoning".into()),
+                    reasoning_history: vec![Some("hidden reasoning".into())],
+                }),
+            },
+        ),
+        event(
+            session,
+            Some(turn),
+            5,
             EventPayload::ToolRequested {
                 call_id: call,
                 name: ToolName("read".into()),
@@ -82,7 +99,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
         event(
             session,
             Some(turn),
-            5,
+            6,
             EventPayload::ToolStarted {
                 call_id: call,
                 execution_id: ExecutionId::new(),
@@ -91,7 +108,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
         event(
             session,
             Some(turn),
-            6,
+            7,
             EventPayload::ToolFailed {
                 call_id: call,
                 error: ToolError::from("file missing"),
@@ -105,7 +122,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
     let invalid = event(
         session,
         Some(turn),
-        7,
+        8,
         EventPayload::TurnCompleted {
             text: ModelText("done".into()),
         },
@@ -116,7 +133,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
     let failed = event(
         session,
         Some(turn),
-        7,
+        8,
         EventPayload::TurnFailed {
             error: "tool failed".into(),
         },
@@ -124,4 +141,18 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
     reduce(&mut state, &failed).unwrap();
     assert_eq!(state.status, SessionStatus::Failed);
     assert!(state.active_turn.is_none());
+    let continuation = state.provider_continuation.as_ref().unwrap();
+    assert!(continuation.response_id.is_none());
+    assert_eq!(
+        continuation.native_call_ids.get(&call).map(String::as_str),
+        Some("native-call")
+    );
+    assert_eq!(
+        continuation.reasoning_content.as_deref(),
+        Some("hidden reasoning")
+    );
+    assert_eq!(
+        continuation.reasoning_history,
+        vec![Some("hidden reasoning".into())]
+    );
 }

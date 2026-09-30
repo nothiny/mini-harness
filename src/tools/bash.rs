@@ -124,6 +124,10 @@ impl Tool for BashTool {
         }
     }
 
+    fn validate_input(&self, input: &Value) -> Result<(), String> {
+        self.parse_input(input.clone()).map(|_| ())
+    }
+
     async fn execute(&self, input: Value, ctx: ToolContext<'_>) -> Result<String, String> {
         let (command, timeout) = self.parse_input(input)?;
         if ctx.cancel.is_cancelled() {
