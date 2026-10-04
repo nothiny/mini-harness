@@ -51,6 +51,7 @@ cargo run -- run "hello"          # 持久化会话（默认 mock provider）
 | `run` / `resume` / `cancel` | 持久化会话；省略 `--event-log` 时使用 `~/.mini-harness/sessions/<id>/` 目录布局 |
 | `serve --stdio` | JSONL 协议服务器（`session.create`、`turn.start/wait/cancel`、`approval.respond`…） |
 | `tui` / `events` | 交互式 UI / 一次性事件查看器，只消费安全事件投影 |
+| `benchmark` | 按 TOML/JSON 清单执行非交互任务并保存事件、checkpoint 与机器可读结果 |
 | `inspect` / `recover` / `abandon-turn` / `sessions` | 恢复工具：分类未完成工作、标记未知结果、显式放弃 |
 | `init` / `config` / `doctor` | 写默认配置 / 打印生效配置 / 环境体检 |
 | `demo read` / `demo edit-bash` | 内存事件日志的离线演示，不联系真实 provider |
@@ -85,6 +86,20 @@ bash = "allow"   # 模型可不经确认执行任意命令，仅限受控环境
 - `deepseek-flash` 支持函数调用（read/edit/bash 工具链可用）
 - `serve --stdio` 的 session 参数同样接受 `provider: "deepseek"`；`doctor` 会检查 `DEEPSEEK_API_KEY`
 - 其他 Chat Completions 兼容服务（Kimi、Qwen、vLLM、Ollama……）可通过 `OpenAiProviderConfig::with_endpoint(...).with_wire_style(WireStyle::ChatCompletions)` 接入
+
+### Benchmark
+
+`benchmark` 用一个固定清单顺序执行多个独立 workspace。它会在每次运行的唯一 artifact 目录保存原始 JSONL 事件、checkpoint、清单和脱敏后的有效配置，并持续写入 `results.json`。结果中的 `execution_status` 描述 harness 是否正常完成；`task_result` 默认是 `not_verified`，必须由 Harbor 或其他独立 verifier 检查 workspace 后决定。
+
+```bash
+mkdir -p /tmp/mini-harness-benchmark-task
+cargo run --release -- benchmark benchmark/tasks.example.toml \
+  --provider deepseek --model deepseek-chat \
+  --artifacts ./benchmark-artifacts \
+  --results ./benchmark-results.json
+```
+
+当前 benchmark runner 不安装 shell 的 OS 级 sandbox；真实评测应在 Harbor 的一次性 task 容器中运行。固定的 Terminal-Bench 2.1 开发子集、oracle 预检和 Harbor 适配器见 [`benchmark/harbor/README.md`](benchmark/harbor/README.md)。
 
 ### 交互式 TUI
 

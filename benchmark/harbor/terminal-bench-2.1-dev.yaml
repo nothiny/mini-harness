@@ -1,0 +1,46 @@
+# Reproducible, CPU-oriented Terminal-Bench 2.1 development subset.
+#
+# The dataset repository and commit are pinned so task text and verifiers do
+# not silently change. This is deliberately a small development subset, not
+# an official Terminal-Bench score.
+job_name: mini-harness-terminal-bench-2-1-dev
+jobs_dir: ./benchmark-jobs
+n_attempts: 1
+n_concurrent_trials: 1
+timeout_multiplier: 1.0
+
+agents:
+  - import_path: benchmark.harbor.mini_harness_agent:MiniHarnessAgent
+    model_name: deepseek/deepseek-chat
+    kwargs:
+      binary: /absolute/path/to/target/release/mini-harness
+      provider: deepseek
+      network: inherited
+      # Terminal-Bench tasks intentionally edit system paths such as /etc and
+      # /var. Each Harbor task runs in an isolated container, so the adapter
+      # can safely use the container root as the harness workspace boundary.
+      workspace_root: /
+      max_steps: 20
+      max_turn_time_ms: 600000
+      run_timeout_sec: 1800
+    include_logs:
+      - mini-harness-events.jsonl
+      - mini-harness.stdout
+      - mini-harness-metadata.json
+      - mini-harness-execution.json
+
+datasets:
+  - repo: https://github.com/harbor-framework/terminal-bench-2-1
+    ref: 7131e4375048a0e408a8fb404b5f499d726b695b
+    task_names:
+      - cancel-async-tasks
+      - configure-git-webserver
+      - count-dataset-tokens
+      - fix-git
+      - git-multibranch
+      - log-summary-date-ranges
+      - nginx-request-logging
+      - regex-log
+      - sanitize-git-repo
+      - sqlite-db-truncate
+      - write-compressor

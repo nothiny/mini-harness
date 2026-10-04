@@ -1,6 +1,5 @@
 use mini_harness::{
     durable::{EventPayload, EventStore, InMemoryEventStore},
-    error::HarnessError,
     executor::LocalExecutor,
     model::{
         ModelProvider, ModelRequest, ModelResponse, OpenAiProvider, OpenAiProviderConfig, WireStyle,
@@ -230,6 +229,7 @@ async fn openai_continues_tool_output_with_native_call_id() {
             HistoryItem::Tool {
                 call_id: call.call_id,
                 name: call.name.clone(),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("file contents".into()),
             },
         ],
@@ -282,6 +282,7 @@ async fn openai_replays_history_when_continuation_configuration_changes() {
             HistoryItem::Tool {
                 call_id: ToolCallId::new(),
                 name: ToolName("read".into()),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("file contents".into()),
             },
         ],
@@ -554,7 +555,16 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
     );
     let mut first = first;
     first["choices"][0]["message"]["reasoning_content"] = json!("tool reasoning");
-    let second = cc_body("cc_final", Some("all done"), &[]);
+    let second = cc_body(
+        "cc_second_tool",
+        None,
+        &[json!({
+            "id": "call_cc_second_tool",
+            "type": "function",
+            "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"},
+        })],
+    );
+    let final_response = cc_body("cc_final", Some("all done"), &[]);
     let (endpoint, requests, server) = spawn_server(vec![
         ResponseFixture {
             status: 200,
@@ -567,6 +577,12 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
             content_type: "application/json",
             headers: "",
             body: second.to_string(),
+        },
+        ResponseFixture {
+            status: 200,
+            content_type: "application/json",
+            headers: "",
+            body: final_response.to_string(),
         },
     ])
     .await;
@@ -589,7 +605,11 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
     assert_eq!(text, "all done");
 
     let requests = requests.lock().await.clone();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(request["messages"][0]["content"], "read a.txt");
+    }
     let follow_up = &requests[1];
     // Chat completions has no server-side continuation.
     assert!(follow_up.get("previous_response_id").is_none());
@@ -615,10 +635,32 @@ async fn deepseek_round_trips_tool_results_as_chat_messages() {
         .find(|message| message["tool_calls"].is_array())
         .expect("follow-up must carry the tool-call assistant message");
     assert_eq!(tool_assistant["reasoning_content"], "tool reasoning");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            tool_assistant["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap(),
+        json!({"path": "a.txt"})
+    );
+    let last_messages = requests[2]["messages"].as_array().unwrap();
+    let calls = last_messages
+        .iter()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["id"], "call_cc_tool");
+    assert_eq!(calls[1]["id"], "call_cc_second_tool");
+    assert_eq!(
+        serde_json::from_str::<Value>(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap(),
+        json!({"path": "a.txt"})
+    );
 }
 
 #[tokio::test]
-async fn deepseek_replays_reasoning_after_a_failed_tool_turn() {
+async fn deepseek_replays_reasoning_and_error_after_rejected_tool_input() {
     let mut first = cc_body(
         "cc_failed_tool",
         None,
@@ -667,8 +709,8 @@ async fn deepseek_replays_reasoning_after_a_failed_tool_turn() {
 
     // The malformed command is rejected before policy approval. It must not
     // consume a user approval just to discover that the tool cannot run.
-    let failed = session.start_turn("run it".into()).await.unwrap_err();
-    assert!(matches!(failed, HarnessError::Tool(_)));
+    let (_, text) = session.start_turn("run it".into()).await.unwrap();
+    assert_eq!(text, "recovered");
     let events = store
         .read_from(mini_harness::runtime::EventSeq(1))
         .await
@@ -679,8 +721,6 @@ async fn deepseek_replays_reasoning_after_a_failed_tool_turn() {
             .any(|event| matches!(event.payload, EventPayload::ToolApprovalRequested { .. }))
     );
 
-    let (_, text) = session.start_turn("retry".into()).await.unwrap();
-    assert_eq!(text, "recovered");
     server.await.unwrap();
 
     let requests = requests.lock().await;
@@ -690,6 +730,22 @@ async fn deepseek_replays_reasoning_after_a_failed_tool_turn() {
         .find(|message| message["role"] == "assistant")
         .unwrap();
     assert_eq!(assistant["reasoning_content"], "reason before failure");
+    assert_eq!(messages[0]["content"], "run it");
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["arguments"],
+        "{\"command\":5}"
+    );
+    let error = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(error["tool_call_id"], "call_bad_bash");
+    assert!(
+        error["content"]
+            .as_str()
+            .unwrap()
+            .contains("command must be a string")
+    );
 }
 
 #[tokio::test]

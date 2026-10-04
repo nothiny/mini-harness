@@ -705,6 +705,7 @@ mod tests {
             executions: Default::default(),
             tool_names: Default::default(),
             tool_inputs: Default::default(),
+            rejected_tool_calls: Default::default(),
             approvals: Default::default(),
             final_text: None,
         });

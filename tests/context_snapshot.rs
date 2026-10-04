@@ -130,6 +130,51 @@ fn context_snapshot_bounds_total_history_copy() {
     assert!(encoded.len() <= mini_harness::runtime::context::MAX_CONTEXT_HISTORY_BYTES);
 }
 
+#[test]
+fn replay_only_continuation_keeps_the_user_task_and_prior_tool_arguments() {
+    let call_id = ToolCallId::new();
+    let mut state = SessionState::new(SessionId::new());
+    state.history = vec![
+        HistoryItem::User(UserInput("summarize the access log".into())),
+        HistoryItem::Assistant(ModelText("tool call: bash".into())),
+        HistoryItem::Tool {
+            call_id,
+            name: ToolName("bash".into()),
+            input: json!({"command": "cat access.log"}),
+            result: mini_harness::runtime::ToolResult("GET / 200".into()),
+        },
+    ];
+    // This also covers an invalidated Responses cursor: without a server
+    // response ID, the provider has to rebuild the conversation locally.
+    state.provider_continuation = Some(mini_harness::runtime::ProviderContinuation {
+        provider: "openai".into(),
+        response_id: None,
+        model: "deepseek-chat".into(),
+        endpoint: "https://api.deepseek.com/chat/completions".into(),
+        native_call_ids: [(call_id, "call_log".into())].into_iter().collect(),
+        history_cursor: 1,
+        reasoning_content: None,
+        reasoning_history: vec![None],
+    });
+
+    let request = ContextSnapshot::from_state(&state, vec![]).into_model_request();
+
+    assert_eq!(request.history, state.history);
+    assert_eq!(request.continuation.unwrap().history_cursor, 1);
+}
+
+#[test]
+fn legacy_tool_history_without_arguments_remains_readable() {
+    let call_id = ToolCallId::new();
+    let item: HistoryItem = serde_json::from_value(json!({"Tool": {
+        "call_id": call_id,
+        "name": "read",
+        "result": "old result"
+    }}))
+    .unwrap();
+    assert!(matches!(item, HistoryItem::Tool { input, .. } if input.is_null()));
+}
+
 #[tokio::test]
 async fn session_forwards_system_instructions_to_provider() {
     let directory = tempdir().unwrap();

@@ -14,7 +14,8 @@ use crate::{
 /// the original value; only the provider-facing snapshot is bounded.
 pub const MAX_CONTEXT_ITEM_BYTES: usize = 16 * 1024;
 /// Only the most recent bounded history is copied into a provider request.
-/// Continuation requests retain the suffix beginning at their provider cursor.
+/// Stateful continuation requests retain the suffix at their provider cursor;
+/// stateless providers replay the bounded conversation, including the user task.
 pub const MAX_CONTEXT_HISTORY_BYTES: usize = 512 * 1024;
 const TRUNCATION_MARKER: &str = "\n[context item truncated]";
 
@@ -96,10 +97,12 @@ fn bound_history_item(item: HistoryItem) -> HistoryItem {
         HistoryItem::Tool {
             call_id,
             name,
+            input,
             result,
         } => HistoryItem::Tool {
             call_id,
             name,
+            input,
             result: ToolResult(bound_text(&result.0)),
         },
     }
@@ -109,6 +112,10 @@ fn history_start(state: &SessionState) -> usize {
     let continuation_start = state
         .provider_continuation
         .as_ref()
+        // Chat Completions persists native tool IDs and reasoning here, but
+        // does not retain messages on the server. Its cursor is bookkeeping,
+        // not permission to omit the original user task after a tool call.
+        .filter(|continuation| continuation.response_id.is_some())
         .map(|continuation| continuation.history_cursor.min(state.history.len()));
     let mut size = 2usize;
     let mut start = state.history.len();

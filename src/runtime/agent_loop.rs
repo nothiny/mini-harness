@@ -587,23 +587,17 @@ where
                 let tool = match self.tools.lookup(&call_name.0) {
                     Ok(tool) => tool,
                     Err(error) => {
-                        let message = error.to_string();
                         self.append(
                             Some(turn),
                             EventPayload::ToolFailed {
                                 call_id,
-                                error: message.clone().into(),
+                                error: error.to_string().into(),
                             },
                         )
                         .await?;
-                        self.append(
-                            Some(turn),
-                            EventPayload::TurnFailed {
-                                error: message.clone(),
-                            },
-                        )
-                        .await?;
-                        return Err(HarnessError::Tool(message.into()));
+                        // No tool ran. Return the durable failure to the model
+                        // so it can select an available tool on the next step.
+                        continue;
                     }
                 };
                 if let Err(error) = tool.validate_input(&call_input) {
@@ -611,18 +605,14 @@ where
                         Some(turn),
                         EventPayload::ToolFailed {
                             call_id,
-                            error: error.clone().into(),
+                            error: error.into(),
                         },
                     )
                     .await?;
-                    self.append(
-                        Some(turn),
-                        EventPayload::TurnFailed {
-                            error: error.clone(),
-                        },
-                    )
-                    .await?;
-                    return Err(HarnessError::Tool(error.into()));
+                    // Validation is side-effect free. Keep the turn alive to
+                    // allow corrected arguments, subject to the same turn
+                    // limits and policy checks as every other call.
+                    continue;
                 }
                 let workspace = self.executor.workspace_root();
                 match self

@@ -18,3 +18,6 @@ mini-harness-tui.checkpoint.json
 *.jsonl.lock
 *.checkpoint.json.lock
 
+# Python benchmark adapter caches.
+__pycache__/
+*.py[cod]

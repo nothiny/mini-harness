@@ -1,0 +1,3 @@
+# Harbor 0.23.0 is the API used by mini_harness_agent.py.
+# Harbor currently requires Python >= 3.12; keep it optional for Rust/UI work.
+harbor==0.23.0

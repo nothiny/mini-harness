@@ -42,15 +42,16 @@ fn push_history(state: &mut SessionState, item: HistoryItem) -> Result<(), Harne
 /// an incomplete provider exchange. The reasoning sequence and native ids
 /// are independent replay metadata, so retain them with a replay-only
 /// continuation. This keeps the next request from reusing a stale response
-/// id while still satisfying DeepSeek's replay contract for prior tool
+/// id while still satisfying Chat Completions' replay contract for prior tool
 /// messages.
 fn reset_provider_cursor(state: &mut SessionState) {
     let Some(mut continuation) = state.provider_continuation.take() else {
         return;
     };
-    let has_reasoning = continuation.reasoning_content.is_some()
+    let has_replay_metadata = !continuation.native_call_ids.is_empty()
+        || continuation.reasoning_content.is_some()
         || continuation.reasoning_history.iter().any(Option::is_some);
-    if !has_reasoning {
+    if !has_replay_metadata {
         return;
     }
     continuation.response_id = None;
@@ -128,6 +129,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                 executions: Default::default(),
                 tool_names: Default::default(),
                 tool_inputs: Default::default(),
+                rejected_tool_calls: Default::default(),
                 approvals: Default::default(),
                 final_text: None,
             });
@@ -313,6 +315,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                 .get(call_id)
                 .cloned()
                 .ok_or_else(|| HarnessError::InvariantViolation("missing tool name".into()))?;
+            let tool_input = turn.tool_inputs.get(call_id).cloned().unwrap_or_default();
             turn.executions.insert(
                 *call_id,
                 ExecutionState::Completed {
@@ -324,6 +327,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                 HistoryItem::Tool {
                     call_id: *call_id,
                     name: tool_name,
+                    input: tool_input,
                     result: result.clone(),
                 },
             )
@@ -339,6 +343,17 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                 }
                 None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
             };
+            if matches!(turn.executions.get(call_id), Some(ExecutionState::Pending))
+                && !matches!(turn.approvals.get(call_id), Some(ApprovalStatus::Denied))
+            {
+                turn.rejected_tool_calls.insert(*call_id);
+            }
+            let tool_name = turn
+                .tool_names
+                .get(call_id)
+                .cloned()
+                .ok_or_else(|| HarnessError::InvariantViolation("missing tool name".into()))?;
+            let tool_input = turn.tool_inputs.get(call_id).cloned().unwrap_or_default();
             turn.executions.insert(
                 *call_id,
                 ExecutionState::Failed {
@@ -347,7 +362,15 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                     },
                 },
             );
-            Ok(())
+            push_history(
+                state,
+                HistoryItem::Tool {
+                    call_id: *call_id,
+                    name: tool_name,
+                    input: tool_input,
+                    result: crate::runtime::ToolResult(error.to_string()),
+                },
+            )
         }
         EventPayload::ToolOutcomeUnknown { call_id, reason: _ } => {
             let turn = active_turn_mut(state, event)?;
@@ -406,11 +429,11 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
         }
         EventPayload::TurnCompleted { text } => {
             let turn = active_turn_mut(state, event)?;
-            if turn
-                .executions
-                .values()
-                .any(|execution| !matches!(execution, ExecutionState::Completed { .. }))
-            {
+            if turn.executions.iter().any(|(call_id, execution)| {
+                !(matches!(execution, ExecutionState::Completed { .. })
+                    || matches!(execution, ExecutionState::Failed { .. })
+                        && turn.rejected_tool_calls.contains(call_id))
+            }) {
                 return Err(HarnessError::InvariantViolation(
                     "turn completed with unfinished or failed tool execution".into(),
                 ));

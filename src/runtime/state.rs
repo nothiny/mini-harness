@@ -3,7 +3,7 @@ use super::{
     types::{EventSeq, ExecutionState, ModelText, ToolName, ToolResult, UserInput},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Provider-owned cursor used to continue a response after tool execution.
 ///
@@ -68,6 +68,10 @@ pub struct TurnState {
     /// for requests that are replayed after the snapshot.
     #[serde(default)]
     pub tool_inputs: HashMap<ToolCallId, serde_json::Value>,
+    /// Calls rejected before execution can be corrected by a later model
+    /// response. Keep them distinct from failures after an effect may occur.
+    #[serde(default)]
+    pub rejected_tool_calls: HashSet<ToolCallId>,
     pub approvals: HashMap<ToolCallId, ApprovalStatus>,
     pub final_text: Option<ModelText>,
 }
@@ -85,6 +89,7 @@ impl TurnState {
             executions: HashMap::new(),
             tool_names: HashMap::new(),
             tool_inputs: HashMap::new(),
+            rejected_tool_calls: HashSet::new(),
             approvals: HashMap::new(),
             final_text: None,
         }
@@ -140,6 +145,10 @@ pub enum HistoryItem {
     Tool {
         call_id: ToolCallId,
         name: ToolName,
+        /// Original arguments are required when stateless providers replay
+        /// assistant tool calls. Legacy snapshots did not retain this field.
+        #[serde(default)]
+        input: serde_json::Value,
         result: ToolResult,
     },
 }

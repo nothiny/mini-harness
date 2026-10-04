@@ -1,0 +1,12 @@
+# Development-only manifest for `mini-harness benchmark`.
+# Workspaces must already exist; the runner never creates a missing task
+# workspace, so a benchmark environment cannot be silently replaced by an
+# empty directory.
+name = "mini-harness-smoke"
+version = 1
+
+[[tasks]]
+id = "local-smoke"
+prompt = "Inspect the workspace, make the requested change, and run the relevant checks."
+workspace = "/tmp/mini-harness-benchmark-task"
+metadata = { suite = "local-smoke", verifier = "external" }

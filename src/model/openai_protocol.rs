@@ -427,9 +427,9 @@ fn validate_id(id: &str) -> Result<(), ProviderError> {
 /// before each tool result, not the raw tool_calls. Chat completions requires
 /// every `role:tool` message to be preceded by an assistant message carrying
 /// the matching `tool_calls`, so the builder synthesizes that assistant
-/// message from the summary text (content) plus the tool identity known from
-/// the tool item itself. The original `arguments` were not retained in
-/// history; `{}` is echoed, which every compatible server accepts.
+/// message from the summary text (content) plus the tool identity and original
+/// arguments retained in history. Only legacy snapshots without arguments
+/// fall back to `{}`.
 pub(super) fn build_cc_messages(
     history: &[HistoryItem],
     native_call_ids: &std::collections::HashMap<ToolCallId, String>,
@@ -472,6 +472,7 @@ pub(super) fn build_cc_messages(
                     let HistoryItem::Tool {
                         call_id,
                         name,
+                        input,
                         result,
                     } = &history[index]
                     else {
@@ -488,7 +489,14 @@ pub(super) fn build_cc_messages(
                     tool_calls.push(json!({
                         "id": native,
                         "type": "function",
-                        "function": {"name": name.0, "arguments": "{}"},
+                        "function": {
+                            "name": name.0,
+                            "arguments": if input.is_null() {
+                                "{}".to_owned()
+                            } else {
+                                input.to_string()
+                            },
+                        },
                     }));
                     tool_results.push(json!({
                         "role": "tool",
@@ -924,6 +932,7 @@ mod tests {
             HistoryItem::Tool {
                 call_id: ToolCallId::new(),
                 name: ToolName("read".into()),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("x".into()),
             },
         ];
@@ -943,6 +952,7 @@ mod tests {
             HistoryItem::Tool {
                 call_id: ToolCallId::new(),
                 name: ToolName("read".into()),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("contents".into()),
             },
             HistoryItem::Assistant(ModelText("done".into())),
@@ -1013,11 +1023,13 @@ mod tests {
             HistoryItem::Tool {
                 call_id: first_call,
                 name: ToolName("read".into()),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("first".into()),
             },
             HistoryItem::Tool {
                 call_id: second_call,
                 name: ToolName("read".into()),
+                input: json!({"path": "a.txt"}),
                 result: ToolResult("second".into()),
             },
         ];

@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod config;
 pub mod durable;
 pub mod error;

@@ -148,6 +148,7 @@ async fn contract_tool_result_continuation(provider: &dyn ModelProvider) {
     follow_up_history.push(HistoryItem::Tool {
         call_id: call.call_id,
         name: call.name.clone(),
+        input: json!({"path": "a.txt"}),
         result: ToolResult("{\"text\":\"file content\"}".into()),
     });
     let follow_up = request(follow_up_history).with_continuation(Some(continuation));
