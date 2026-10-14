@@ -1,178 +1,229 @@
-# 第 5 章：AgentLoop——一轮 turn 怎样反复采样
+# 第 5 章：AgentLoop 的完整实现
 
-前几章分别讲了事件、provider 和工具。这一章把它们放在同一个控制循环里。
+## 1. 本章解决什么问题
 
-读完以后，你应该能从 src/runtime/agent_loop.rs 解释：用户输入怎样变成第一次模型请求，工具结果怎样进入下一次请求，一轮 turn 在什么情况下完成或失败。
+用户要求读取文件，模型先返回 ToolCall，再给最终文本。把两次请求接起来很容易；难点是审批、错误、重复 call、取消、超时都必须留下与状态一致的事实。本章逐步阅读最重要的控制循环。
 
-## 先找真正的入口
+## 2. 先理解设计思想
 
-当前 AgentLoop 的主要入口分布在两个文件：
+循环是一位指挥者：它决定何时采样、何时授权执行、何时暂停或结束。它不自己编码 HTTP 或修改文件。每个可观察状态改变都经过 append；异步任务只返回数据或通过 observer 请求记账，不持有可变 SessionState。
 
-- src/runtime/agent_loop_setup.rs：构造新 loop、从日志恢复 loop；
-- src/runtime/agent_loop.rs：append、开始 turn、继续 turn、取消和限制。
+## 3. 模块在整体架构中的位置
 
-先看方法之间的关系：
+```mermaid
+stateDiagram-v2
+    [*] --> Begin
+    Begin --> Sampling: 输入与 TurnStarted 持久化
+    Sampling --> Finish: Text
+    Sampling --> ValidateBatch: 含工具调用
+    ValidateBatch --> Requested: 合法批次
+    ValidateBatch --> Failed: 空/重复/过大
+    Requested --> Executing: lookup 成功且 Allow
+    Requested --> WaitingApproval: Ask
+    Requested --> Failed: lookup 失败或 Deny
+    WaitingApproval --> Executing: approve_tool(true)
+    WaitingApproval --> Cancelled: approve_tool(false)
+    Executing --> Sampling: 本批顺序执行完且 ToolCompleted
+    Executing --> Failed: 普通工具错误/结果过大
+    Executing --> Cancelled: 取消且能确认工具结果
+    Executing --> Unknown: 清理超时/清理 task 失败/执行 deadline
+    Sampling --> Cancelled: token
+    Sampling --> TimedOut: provider/turn deadline
+    Sampling --> Failed: provider error/step limit
+    Finish --> [*]: TurnCompleted
+    Failed --> [*]: TurnFailed
+    Cancelled --> [*]: TurnCancelled
+    TimedOut --> [*]: TurnTimedOut
+    Unknown --> [*]: API 返回错误，active_turn 保留
+```
 
-~~~text
-run_turn(input)
-  └─ run_turn_with_cancel(input, token)
-       └─ run_turn_with_reason(...)
-            ├─ begin_turn(...)
-            └─ continue_turn(...)
-                 └─ continue_turn_with_reason(...)
-~~~
+Unknown 是此图的执行函数出口，不是持久化 Turn 的终态。审批恢复也可能再次遇到 Ask。
 
-begin_turn 负责把用户输入和 turn.started 变成事实。continue_turn_with_reason 才是反复请求 provider、处理工具调用和判断终态的循环。
+## 4. 源码位置
 
-## 主循环的每一轮
+- [agent_loop.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop.rs)：AgentLoopConfig、append、run_turn_with_reason、begin_turn、continue_turn_with_reason、bounded_tool_deadline。
+- [sampling.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/sampling.rs)：sample_model。
+- [context.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/context.rs)：ContextSnapshot、history_start、bound_text。
+- [agent_loop_approval.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop_approval.rs)：approve_tool、cancel_active_after_shutdown。
+- [agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop_setup.rs)：new_with_config、from_state。
+- [tests/context_snapshot.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/context_snapshot.rs)、[tests/agent_loop_limits.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/agent_loop_limits.rs)、[tests/integration_agent_loop.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/integration_agent_loop.rs)、[tests/policy.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/policy.rs)。
 
-把实际代码压缩成伪代码：
+## 5. 从入口逐步分析源码
 
-~~~text
-while turn 还没有终态:
-    检查 cancel、step、turn time、tool time
-    从 SessionState 构造 ContextSnapshot
-    转成 ModelRequest
-    调 provider，得到 ModelCompletion
+### 5.1 谁调用哪一个入口
 
-    如果 continuation 改变:
-        append provider.continuation.updated
+```text
+Session::start_turn → run_turn
+  → run_turn_with_cancel → run_turn_with_reason
+      → begin_turn → begin_queued_turn
+      → continue_turn_with_reason
+Actor: begin_turn → continue_turn → continue_turn_with_reason
+审批: approve_tool → 执行待审批 call → continue_turn
+```
 
-    如果响应是 Text:
-        append model.response.recorded
-        append turn.completed
-        返回最终文本
+直接 Session 接收输入并等最终结果；Actor 先 begin、回复 Start ack，再等 continue future。`run_turn_with_id` 接受调用方给的 TurnId；`run_turn_with_timeout` 用外层计时器触发 token，并把 Cancelled 返回映射为 Timeout。不要把它们误当成同一个超时来源。
 
-    如果响应是 ToolCall 或 ToolCalls:
-        检查是否为空、是否重复、是否超过 batch 上限
-        append model.response.recorded
-        对每个 call:
-            append tool.requested
-            通过 policy
-            Allow → append tool.started → 执行 → append tool.completed/failed
-            Ask → append tool.approval.requested，暂停
-            Deny → append tool.policy_denied，结束或继续
-        回到下一轮采样
-~~~
+`AgentLoop<P,E,S>` 持有共享组件 Arc 和独占 state，还持有非持久化的 turn_started_at、turn_steps、tool_time_used。`P: ModelProvider` 等 trait bound 表示“这个泛型类型必须具备此能力”，不是另一个运行时模块。
 
-这段循环没有直接修改 history。所有改变都经过 append，再由 reducer 更新 state。
+### 5.2 每轮采样前检查什么
 
-## ModelResponse 为什么也会记录工具调用
+`continue_turn_with_reason` 先算 turn_deadline，再进入 loop，依次检查 token、max_steps、墙钟预算、累计工具预算。时长为零关闭相应预算；max_steps 为零则第一轮前失败。超 step 追加 TurnFailed 并返回 Provider 错误；采样前时长超限追加 TurnTimedOut 并返回 Timeout。
 
-一个模型响应可以是文本，也可以是工具调用。当前实现把工具调用转换成一个可观察的 model.response.recorded，内容类似：
+通过检查后递增 steps，再 `ContextSnapshot::from_state(&state, tools.specs())`。system instructions 是 loop 的独立可选字段，经 snapshot 限长；CLI 主路径没有自动设置它。
 
-~~~text
-tool call: read
-tool calls: read, bash
-~~~
+快照拥有自己的 history/specs/continuation，因此 task 不必借用 state。单项模型可见文本限制 16 KiB，普通历史窗口目标 512 KiB；UTF-8 截断先退到字符边界。durable history 保留原值，且 reducer 有 1 MiB 硬上限；快照截短不能让会话历史无限增长。
 
-它不是工具结果，也不替代 tool.requested。它表示“模型这次说了什么”；tool.requested 表示“runtime 接受了哪个调用并开始处理状态机”。
+`history_start` 对 continuation 有额外规则：保留 cursor 开始所需的 suffix，使用 `start.min(cursor)`，因此不能把 512 KiB 描述成所有 continuation 场景的绝对硬上限。转成 ModelRequest 后还序列化检查 max_context_bytes（默认 1 MiB），包含 tools 等字段。超限记录 TurnFailed。
 
-工具调用执行后，ToolCompleted 才会把 ToolResult 加入 history，供下一次 ModelRequest 使用。
+### 5.3 sample_model 怎样同时等模型与控制信号
 
-## ContextSnapshot 是模型看到的窗口
+`sample_model(request, turn, token, turn_deadline, reason)` 创建容量 1 的 mpsc observer，clone provider/token，spawn `complete_observed`。拥有的数据可 move 进 task，`'static` 表示 task 不借用即将消失的栈变量，不表示对象永远不能释放。
 
-打开 src/runtime/context.rs。ContextSnapshot 是拥有所有权的、不可变的模型输入：
+`tokio::select!` 同时轮询四类 future：取消、`min(provider.request_timeout, turn_deadline)`、observer.recv、task 完成。这里有 `biased`，已就绪取消/timeout 优先于后面的结果分支。
 
-~~~text
-SessionState
-  ├─ history
-  ├─ provider_continuation
-  └─ tools
-       │
-       ▼
-ContextSnapshot
-  ├─ 有限 history
-  ├─ 有限的每项文本
-  ├─ tools
-  └─ continuation
-       │
-       ▼
-ModelRequest
-~~~
+observer 发送 `(ProviderAttempt, oneshot ack)`；loop 追加 ProviderAttemptRecorded 成功后才 `ack.send(())`。Provider 等 ack，再发 HTTP 或继续重试，所以这不是事后把 attempts Vec 复制进日志。容量与 ack 提供背压，也防止 Provider 绕过单写者直接 append。
 
-它有两个重要限制：
+取消/采样超时会 abort task 并 await 收尾，写取消/超时事件。Provider 返回 Err 时写 TurnFailed；task join 失败归为 ProviderError。普通 Mock 不报告 attempts，因此 Demo 不出现 attempt 事件。
 
-- 单条 history item 默认最多 16 KiB；
-- provider 看到的 history 总量默认最多 512 KiB。
+### 5.4 ModelCompletion 如何变成事实
 
-截断只发生在 ContextSnapshot，不会删除 durable history。日志保留完整事实，模型请求只携带当前预算允许的部分。
+completion.continuation 与现有 cursor 不相同时，先追加 ProviderContinuationUpdated。它保存 native ID 映射和历史位置，随后才追加本次 ModelResponseRecorded。
 
-如果有 provider continuation，history_start 会根据 history_cursor 选择需要发送的历史窗口。续传 provider 和完整回放 provider 都通过同一个 ModelRequest 接口工作。
+Text 分支保存模型文本，再保存 TurnCompleted，返回 `(turn, text)`。持久化任何一步失败，会尽力追加 TurnFailed，但不能保证坏 store 还能接受这条终态；返回原错误，交给恢复检查。
 
-## append 是主循环的安全边界
+ToolCall 归一成一项 Vec；ToolCalls 保留列表；TextWithToolCalls 保留文字并处理 calls。批次先验证非空、同批 ID 不重复、数量不超过 max_batch_tool_calls，默认 16。违规时失败，而且不会写该批 ToolRequested。跨 step 重复 ID 则由 reducer 的 ToolRequested 分支拒绝。
 
-AgentLoop::append 的顺序必须牢记：
+工具批次的 ModelResponseRecorded 使用真实混合文本（有文本时）或 `tool call: read` / `tool calls: ...` 摘要。它记录助手说了什么，不是 ToolResult，也没有保存原始 wire tool_calls。
 
-~~~text
-1. expected_seq = state.last_seq + 1
-2. 确认 store 没被其他进程追加
-3. 检查事件序列化后的大小
-4. 在 next_state 副本上调用 reduce
-5. store.append(event)
-6. 检查 store 返回 seq
-7. 提交 self.state = next_state
-~~~
+### 5.5 工具生命周期按什么顺序走
 
-如果先修改 self.state，再写日志，进程在中间崩溃，内存曾经看到过一个事实，日志却没有它。恢复时就会出现两个世界。
+对 calls 使用普通 `for`，每项等执行完再处理下一项：**本项目没有并行工具批次**。
 
-如果 provider 响应产生空工具批次、重复 call_id、超过 max_batch_tool_calls 或超过 step 上限，runtime 会先记录 turn.failed，再返回错误。错误路径也必须是事件路径。
+1. append ToolRequested：保存 name/input，execution=Pending。
+2. Registry.lookup：不存在则 ToolFailed+TurnFailed，不启动副作用。
+3. policy.decide：Allow 继续；Deny 保存 ToolPolicyDenied+TurnFailed；Ask 保存 ToolApprovalRequested 后返回 ApprovalPending。
+4. Allow 后新建 ExecutionId、append ToolStarted，execution=Running。
+5. clone Executor/Tool，构造 ToolContext，spawn execute。
+6. 等 task、token 或工具 deadline；普通成功检查结果字节数、append ToolCompleted，reducer 写入 Tool history。
+7. 本批结束后重新采样。
 
-## 取消、超时和审批
+Ask 中 `ToolBatchDeferred` 只记录后续 call 的 ID 和原因，它们尚未成为 ToolRequested，参数没有持久化到这些 deferred calls 的执行表。`approve_tool` 执行当前待审批工具后重新采样；**没有从原批次自动恢复剩余列表**。模型需重新提出后续动作。不能把 defer 解读成完整持久化批次任务队列。
 
-取消和超时有不同的事件：
+### 5.6 工具结果与错误如何返回
 
-~~~text
-用户取消
-  └─ turn.cancel_requested
-  └─ turn.cancelled
+Tool trait 是 `Result<String,String>`。成功的字符串进 ToolCompleted 和 history，成为下一次 ModelRequest；错误字符串（工具把类型错误编码为 JSON）进 ToolFailed，然后 TurnFailed，返回 HarnessError::Tool。当前普通 Err 路径没有下一次模型请求，不会自动让模型修复参数。
 
-时间预算耗尽
-  └─ turn.timed_out
-~~~
+非零进程 exit_code 或 process.timed_out 则不同：Executor 可以返回 `Ok(ProcessResult)`，BashTool 把它作为成功字符串；模型可看到其状态字段，继续决定。区分 Rust 的 Ok/Err 和命令业务成功非常重要。
 
-工具的取消还要等 executor 收尾。审批则是另一种暂停：
+### 5.7 取消与 deadline 为何分支不同
 
-~~~text
-tool.requested
-  → tool.approval.requested
-  → turn 保持 active
-  → 用户批准
-  → tool.approval.responded
-  → tool.started
-  → 工具完成
-  → 回到采样
-~~~
+工具 deadline 是 turn deadline 和剩余累计 tool budget 的较小值，累计时间包括工具 task 内等待 Executor 槽位。取消分支给 task 1 秒清理：
 
-审批不是 provider 错误。它是一个已经持久化的控制状态，所以 UI 或协议客户端重启后仍然可以看到“正在等待审批”。
+| 清理结果 | 追加事实 | Turn 状态 |
+|---|---|---|
+| 明确 Ok 且大小合法 | ToolCompleted，再取消/超时终态 | active_turn 清空 |
+| 明确 Err 或结果过大 | ToolFailed，再取消/超时终态 | active_turn 清空 |
+| JoinError / 超过 1 秒 | ToolOutcomeUnknown | active_turn 保留 |
 
-## 建议的阅读实验
+正常执行的 deadline 分支当前直接 abort 工具 task，记录 ToolOutcomeUnknown，返回 Timeout，没有必然的 TurnTimedOut。批准工具的 deadline 也如此。已发生的文件写入/外部命令无法因为 future 被 drop 就撤销。
 
-运行：
+普通 task 完成分支的 JoinError 被转成 String，随后走 ToolFailed；不要声称所有 panic 都自动 Unknown。Unknown 的实现保证应按具体分支理解。
 
-~~~bash
-cargo test --test integration_agent_loop
-cargo test agent_loop_passes_system_instructions_through_snapshot
+### 5.8 append 与异步执行如何保持一致
+
+下面是**按真实实现简化的伪代码**，定位到 `AgentLoop::append`：
+
+```text
+next_seq = state.last_seq + 1
+require store.last_seq == state.last_seq
+event = Event::new(...); event.seq = next_seq
+check serialized event size
+next_state = clone(state)
+reduce(next_state, event)
+check serialized next_state.history size
+persisted = store.append(event)
+require persisted.seq == next_seq
+state = next_state
+```
+
+它不会持有锁跨 Provider 调用；独占 loop 借用保证内存单写。若 store 返回意外 seq，代码尽力读取全日志重建 state，再返回 invariant error。precheck 与 append 间不是跨进程 CAS，所以仍要检查返回 seq。外部副作用已经发生的窗口也不在这个事务里。
+
+```mermaid
+sequenceDiagram
+    participant A as Actor或Session
+    participant L as AgentLoop
+    participant P as Provider task
+    participant S as append/store
+    participant T as Tool task
+    participant E as Executor
+    A->>L: begin / continue
+    L->>S: 输入与Turn事件
+    L->>P: complete_observed(snapshot)
+    opt HTTP provider reports attempt
+        P->>L: attempt + ack sender
+        L->>S: ProviderAttemptRecorded
+        L-->>P: ack
+    end
+    P-->>L: ModelCompletion
+    L->>S: continuation、模型响应、工具请求
+    alt Policy Ask
+        L->>S: ApprovalRequested、可选BatchDeferred
+        L-->>A: ApprovalPending（仍 active）
+    else Allow
+        L->>S: ToolStarted
+        L->>T: execute(context)
+        T->>E: 能力请求
+        E-->>T: 类型化结果
+        T-->>L: JSON string
+        L->>S: ToolCompleted、history
+        L->>P: 新 snapshot
+        P-->>L: 最终文本
+        L->>S: ModelResponseRecorded、TurnCompleted
+        L-->>A: (TurnId,text)
+    end
+```
+
+## 6. 完整运行示例
+
+```bash
+cargo test full_mock_read_turn
+cargo test --test context_snapshot
 cargo test --test agent_loop_limits
-~~~
+cargo test --test integration_agent_loop
+cargo test --test policy
+```
 
-在 integration_agent_loop.rs 中找一个脚本为 ToolCall、Text 的测试，画出两次 ModelRequest：
+`multiple_tool_calls_are_executed_in_event_order` 固定批次串行事实；`duplicate_tool_call_ids_fail_the_turn_before_execution` 固定早期拒绝；`oversized_tool_batch_fails_before_any_tool_requested_event` 检查过大批次无执行；`tool_failure_records_terminal_turn_failure` 检查普通错误结束 Turn。
 
-~~~text
-request 1: user history + tool specs
-request 2: user history + tool result + tool specs
-~~~
+## 7. 为什么这么设计
 
-再找一个 max_steps 或空批测试，看它在事件日志里记录哪个终态。
+spawn task 让模型与工具可被 select 控制，并不授权它们改状态。统一 append 让每条合法事实进入同一顺序；副本 reduce 避免失败验证污染真实 state。代价是 clone/编码成本、无法原子地合并外部副作用与事件、以及一些资源故障只能尽力写终态。
 
-## 思考题
+顺序工具避免同一 Turn 的写入竞态和审批交叉，但吞吐受限。遇到 Ask 就返回 loop future，使 Actor 重新取得 state；相比无限 await 用户输入，这提供清晰暂停点，同时需要客户端识别 ApprovalPending。
 
-1. 为什么工具结果必须进入下一次 ModelRequest，而不能只存在 ToolCompleted 事件里？
-2. ContextSnapshot 截断 history 后，为什么 durable log 仍然要保留完整文本？
-3. 如果模型一次返回 100 个工具调用，最早应该在哪一层限制？
-4. append 的副本 reduce 能防止哪些问题，不能防止哪些外部副作用？
-5. 为什么 turn.cancel_requested 和 turn.cancelled 要分成两个事实？
-6. 审批暂停时，Session actor 为什么可以处理新输入；工具执行期间又为什么会延迟处理？
+## 8. 常见误解
 
-下一章：[进程、取消和原子编辑](06-process-cancellation.md)。
+- async 不等于工具并行；并发轮询也不等于多个状态写者。
+- Err(Tool) 通常终止 Turn，结构化错误字符串并不会自动回模型。
+- timeout 不总伴随 TurnTimedOut；执行中强制 abort 可能 Unknown。
+- max_context_bytes 也约束 durable history，snapshot 截断不会自动滚动删除旧事实。
 
+## 9. 本章总结
+
+AgentLoop 的主线是有限快照采样、规范化响应、权限门、顺序工具、结果记账、再次采样。可靠性来自每个异常分支如何结束或保留状态，而不只是 while loop。
+
+## 10. 自测问题
+
+1. Observer ack 何时发？参考：attempt 事件持久化成功后。
+2. Ask 后原批剩余工具会自动执行吗？参考：不会，记录 IDs 后重新采样。
+3. 工具 Err 与 exit_code=7 有何区别？参考：前者 TurnFailed；后者可作为 ToolCompleted 结果回模型。
+4. 为什么 Unknown 不能画成 TurnCancelled？参考：还不能确认副作用，active_turn 保留。
+5. append 副本能保护什么？参考：状态与日志提交顺序；不能撤销外部副作用或消除跨进程写入竞态。
+
+## 11. 下一章如何衔接
+
+下一章进入[Model Provider](08-openai-provider.md)，看同一个 ModelRequest 如何变成两种 HTTP 格式。
+
+---
+
+导航：上一章 [第 4 章：Session 与生命周期](03-mock-provider-and-session.md) · [首页](README.md) · 下一章 [第 6 章：Model Provider 与模型 API 适配](08-openai-provider.md)

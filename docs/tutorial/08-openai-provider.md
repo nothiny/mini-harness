@@ -1,143 +1,135 @@
-# 第 8 章：真实 provider——Responses 与 Chat Completions
+# 第 6 章：Model Provider 与模型 API 适配
 
-前面一直用 MockProvider，是为了先把 runtime 语义固定下来。这一章看真实 HTTP provider 怎样适配同一套 ModelProvider 接口。
+## 1. 本章解决什么问题
 
-当前项目的 provider 代码同时支持：
+把 Mock 换为真实服务后，为什么 AgentLoop 仍只处理 Text 和 ToolCall？模型的原生 call ID 如何穿过一次文件读取，再正确作为工具结果回传？
 
-- OpenAI Responses wire format；
-- DeepSeek、Kimi、Qwen、vLLM、Ollama 等兼容的 Chat Completions wire format。
+## 2. 先理解设计思想
 
-教程先讲共同的数据流，再看两个协议的差异。
+Provider 把内部请求翻译成线上格式，再把线上响应翻回内部数据。它不授权工具、不写 SessionState。wire 的兼容性和 Harness 的执行语义应分开测试；本章讲当前适配器，不承诺外部服务今日所有模型能力。
 
-## 先看三层代码
+## 3. 模块在整体架构中的位置
 
-~~~text
-src/model/provider.rs
-  ModelRequest / ModelResponse / ModelCompletion
+```mermaid
+flowchart LR
+    C[ContextSnapshot] --> R[ModelRequest]
+    R --> B[build_request_body 或 build_cc_request_body]
+    B --> HTTP[execute_attempt / reqwest]
+    HTTP --> PARSE[JSON 或 SSE parser]
+    PARSE --> MC[ModelCompletion + continuation]
+    MC --> L[AgentLoop]
+    OBS[ProviderObserver] -->|attempt + ack| L
+```
 
-src/model/openai_protocol.rs
-  纯函数：runtime 类型 ↔ JSON body / JSON response / SSE
+## 4. 源码位置
 
-src/model/openai.rs
-  配置、HTTP 请求、超时、取消、重试、attempt 观察
-~~~
+- [provider.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/model/provider.rs)：ModelProvider、ModelCompletion、ProviderObserver::record。
+- [mock.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/model/mock.rs)：complete、complete_with_metadata、mock_continuation。
+- [configured.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/model/configured.rs)：ConfiguredProvider 枚举与分派。
+- [openai.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/model/openai.rs)：OpenAiProviderConfig、WireStyle、from_config、complete_request、execute_attempt、read_body。
+- [openai_protocol.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/model/openai_protocol.rs)：build/parse/make continuation 系列函数。
+- [tests/provider_contract.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/provider_contract.rs)、[tests/openai_provider.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/openai_provider.rs)。
 
-runtime 只依赖 ModelProvider。它不知道 endpoint 的 JSON 字段，也不知道 function_call_output 放在 input 还是 message 里。
+## 5. 从入口逐步分析源码
 
-这就是 provider 可替换的实际含义：只要返回相同的 ModelResponse 和 ModelCompletion，AgentLoop 就能继续执行。
+### 5.1 trait 与 Mock 的实际行为
 
-## 两种 wire format 的共同闭环
+最低接口 `complete(request, cancel)` 返回 ModelResponse。默认 complete_with_metadata 包装它，默认 complete_observed 调 metadata；OpenAiProvider override observed 以报告 attempts。只实现 complete 的新 Provider 可以运行，但不会自动获得正确的 native ID cursor 或 attempt 日志。
 
-工具调用会形成两次模型请求：
+Mock 将 requests 复制到 Mutex<Vec> 供断言，按 script 顺序取响应。Delay 内 select token/sleep；脚本耗尽返回 ProviderError；repeating 用于普通 CLI Mock（永远 Text("mock response")）。Mutex 只在短暂复制/弹出时持有，不跨 Delay await。Mock metadata 为工具响应构造 cursor/native ID，Text 时清空，支撑离线续传契约。
 
-~~~text
-请求 1：用户历史 + tools
-响应 1：工具调用
+ConfiguredProvider 是具体枚举，Mock/OpenAi/Deepseek 分支都实现相同 trait。Deepseek 分支使用同一个 OpenAiProvider，但 WireStyle=ChatCompletions。这样 generic loop 不需要每个分支用不同具体类型。
 
-runtime 执行工具
-  └─ 产生 ToolResult
+### 5.2 从配置到 HTTP
 
-请求 2：原来的对话 + 工具结果 + continuation
-响应 2：最终文本或下一批工具调用
-~~~
+`from_config` 检查非空 model/key/endpoint、重试最多 5、timeout 非零。公共 endpoint 要 HTTPS，禁止 URL 凭证、query、fragment；loopback 允许本地测试 HTTP。reqwest 禁止自动重定向，loopback 关闭代理，避免测试意外走外部代理。Debug 用 `<redacted>` 替代 key。
 
-Responses 可能使用 previous_response_id 和 function_call_output；Chat Completions 可能把 assistant tool_calls 和 tool message 放在 messages 中。字段不同，但 runtime 要的行为相同。
+`complete_request` 先编码一次 body，再做 `1..=max_retries+1` 有限尝试。每次新建 `mini-harness-UUID` client request ID；有 observer 时先 record started 并等 ack，然后 `execute_attempt`。
 
-## ProviderContinuation 是翻译桥
+execute_attempt POST endpoint，Bearer key 只用于 HTTP header，设置 x-client-request-id。响应 request ID 做字符/长度筛选，read_body 分块收集，超过 1 MiB 拒绝；即使配置 stream=true，也先收集完整 body，再解析 SSE。此实现没有逐 token UI 输出。
 
-打开 src/runtime/state.rs。ProviderContinuation 中的字段大致包括：
+HTTP 408、一般 429、5xx 和部分 transport 错误可重试；quota 型 429 不重试，401/403、解析失败不重试。Retry-After 支持秒数/日期并最多 30 秒，未提供则指数退避最多 30 秒。每次结束 record completed/retry/failed，等持久化 ack 后继续；取消也覆盖 HTTP 与退避。runtime 外层 deadline 约束整个 sample，不保证把每次 120 秒和全部重试都放宽执行。
 
-~~~text
-provider
-response_id
-model
-endpoint
-native_call_ids: runtime ToolCallId → provider call id
-history_cursor
-reasoning_content（兼容思考模型）
-~~~
+HTTP 400 分支提取 server error.message 并用于错误/日志。因而“密钥在 Debug 中脱敏”不等于任意服务错误消息都已经清洗；不要把适配器描述成通用秘密过滤器。
 
-runtime 的 ToolCallId 属于自己的命名空间。provider 的 call_id 属于 provider。native_call_ids 负责把两边映射起来。
+### 5.3 Responses 的 read 往返
 
-continuation 会作为 provider.continuation.updated 事件持久化。重启后，provider 还能知道当前响应链走到哪里；如果 model 或 endpoint 变化，provider 会回放规范化历史，而不引用旧 response_id。
+第一次 `build_request_body` 用 effective model（request.model 优先），history → input，tools → function 定义，store=true，parallel_tool_calls=false。system instructions 放 instructions。
 
-history_cursor 表示续传需要的历史位置。它让 provider 能发送增量上下文，也让实现明确知道“已经交给 provider 的历史从哪里结束”。
+`parse_response_value` 要求 id、status=completed、output；收集 output_text 与 function_call。`parse_tool_call` 要求 arguments 是 JSON 字符串且解码为对象、name 非空、native ID 合法；生成新的 ToolCallId。重复 native ID 或超过 32 个调用由该解析器拒绝；Loop 另有默认 16 个上限。
 
-## 读请求构造函数
+make_continuation 保存 endpoint/model/response_id、内部 call → native call 映射及 `history_cursor=request.history.len()`。循环保存 cursor 后再记助手摘要/工具结果。
 
-打开 src/model/openai_protocol.rs，先看纯函数而不是 HTTP：
+第二次 body 在 provider/model/endpoint/response ID 匹配时使用 previous_response_id；`build_input` 从 cursor 后取 history，忽略已在服务端响应中的 Assistant 摘要，把 Tool result 编成 `function_call_output` 并使用 native ID。配置不匹配时用规范化历史回放，Tool 被表述为 user 内容，因为新服务不知道旧 native calls。
 
-- build_request_body：Responses body；
-- build_cc_request_body：Chat Completions body；
-- parse_json_response 和 parse_cc_json_response：解析文本与工具调用；
-- parse_stream_response 和 parse_cc_stream_response：聚合 SSE 增量。
+以下是**按当前编码器字段简化的 wire 示例**，不是声称此次访问了真实 API：
 
-纯函数的优点是：你可以用固定 JSON fixture 检查协议转换，不需要网络，也不需要 API key。
+```json
+{"model":"example-model","input":[{"role":"user","content":"read README.md"}],"tools":[{"type":"function","name":"read","description":"...","parameters":{"type":"object"},"strict":false}],"store":true,"stream":false,"parallel_tool_calls":false}
+```
 
-解析器需要逐字段校验：
+续传的关键片段：
 
-~~~text
-响应 id 是否存在
-output 或 choices 是否是预期数组
-文本与工具调用是否能互相区分
-call_id、name、arguments 是否完整
-usage 是否能安全解析
-~~~
+```json
+{"previous_response_id":"resp_1","input":[{"type":"function_call_output","call_id":"native_read_1","output":"{\"text\":\"hello\"}"}]}
+```
 
-schema 不合法是 provider 实现或服务响应问题，不应该靠无限重试掩盖。
+### 5.4 Chat Completions 的差别与限制
 
-## 配置和安全边界
+| 行为 | Responses | Chat Completions 当前实现 |
+|---|---|---|
+| 请求字段 | input / instructions | messages / system |
+| 工具定义 | function 字段平铺 | function 对象嵌套 |
+| 续传 | previous_response_id | 无服务端响应链，重编码 request.history |
+| Tool 回传 | function_call_output | assistant.tool_calls 后接 role:tool |
+| arguments 回放 | 使用 native response 链 | history 未保留参数，合成 `{}` |
+| request.model | 覆盖 config.model | build_cc_request_body 仍使用 config.model |
+| reasoning | 此实现不使用 reasoning_content | 非流式保留并回放到最后 assistant；流式不积累 |
 
-打开 src/model/openai.rs 的 OpenAiProviderConfig 和 WireStyle。配置阶段会检查：
+`build_cc_messages` 暂存 Assistant 文字；遇 Tool history 时合成含 tool_calls 的 assistant，再添 tool message。native ID 有映射就用，否则 fallback runtime ID。它回放的是**请求快照**，不是直接读取所有 durable events，也不是原始对话的逐字重建。
 
-- model 不为空；
-- max_retries 在合理范围；
-- endpoint 只允许可信 URL；
-- 公共地址使用 HTTPS；
-- API key 不进入 Debug、事件或协议；
-- 响应体和单次请求有大小、时间限制。
+CC 非流式只看第一 choice，解析 content/tool_calls/usage；它与 Responses 的校验不完全相同，例如不强制相同的 completed status 或 arguments 对象检查。流式按 delta index 拼 name/arguments/id，当前没有 reasoning/usage，也没有与 Responses 相同的 response.completed 终帧约束。不要把“支持两种 wire”讲成所有校验与高级功能一致。
 
-API key 只在 provider 内部使用。日志里可以记录 request id、response id、attempt 号和 usage，但不能记录密钥或完整错误 body。
+### 5.5 错误到 runtime 的返回
 
-## 重试怎样和事件结合
+编码失败直接 ProviderError；HTTP/解析失败按重试规则处理，最终错误返回 sample_model，由其写 TurnFailed。成功把 ParsedResponse 转为四种 ModelResponse，再包 metadata。Provider 永远不调用 ReadTool；只有 loop 可以依据统一响应启动工具。
 
-provider 可能遇到网络抖动、408、429 或 5xx。当前实现会区分可重试和不可重试：
+## 6. 完整运行示例
 
-~~~text
-网络抖动 / 408 / 429 / 5xx
-  → 有限次数重试，必要时读取 Retry-After
-
-400 / 401 / 响应 schema 错
-  → 记录失败并返回
-~~~
-
-每次尝试都可以通过 ProviderObserver 记录 ProviderAttempt。Session actor 只有在 attempt 事件追加成功后才确认给 provider，保证“日志里看到的尝试”与 runtime 观察一致。
-
-## 取消从哪里进入
-
-ModelProvider::complete 接收 CancellationToken。OpenAiProvider 在 HTTP 请求等待期间 select 取消信号；取消后立即返回 provider 错误或取消错误，AgentLoop 再根据 turn 的原因追加终态事件。
-
-这条路径和 MockProvider 的 Delay 脚本共享同一行为契约。先在 mock 中验证取消，再看真实 HTTP client 如何实现。
-
-## 离线测试怎么读
-
-~~~bash
-cargo test --test openai_provider
+```bash
 cargo test --test provider_contract
-~~~
+cargo test --test openai_provider
+```
 
-这些测试用 tokio TcpListener 启动本地 mock server。读测试时先找 server 收到的 request body，再找 provider 解析的 ModelResponse，最后看 AgentLoop 是否按同一语义继续。
+契约组让 Mock、Responses、CC 通过文本、单调用、多调用、错误、取消、工具结果回传六场景。HTTP 测试启动本地 TcpListener，断言实际 POST body 和 cursor/native ID，不需要 API key或外网。关注 `openai_continues_tool_output_with_native_call_id` 与 `deepseek_round_trips_tool_results_as_chat_messages`。
 
-契约测试的价值在于：MockProvider 和 OpenAiProvider 不是靠“接口看起来一样”证明可替换，而是要通过相同的文本、工具调用、错误、取消和续传场景。
+## 7. 为什么这么设计
 
-## 思考题
+把 build/parse 放纯函数，HTTP 放另一个层，既能定位编码问题，也能用本地 fixture 测重试和取消。持久化 native 映射使恢复后还能回传结果；代价是 runtime state 保存部分 provider 细节。SSE 聚合易于复用统一响应，但牺牲实时增量和部分流式元数据。
 
-1. 为什么 runtime 不直接保存 provider 的 native call_id？
-2. 如果换 model 后旧 response_id 失效，provider 应该怎样构造下一次请求？
-3. 429 的 Retry-After 为什么比固定 sleep 更可靠？
-4. 响应 JSON 不合法时为什么不建议直接重试？
-5. API key 只出现在 provider 内部，为什么仍然要测试 Debug 输出和事件日志？
-6. “请求已发出但进程在收到响应前崩溃”属于 provider 失败、结果未知，还是另一种事实？你会把它放在哪一层处理？
+## 8. 常见误解
 
-下一章：[CLI 和 JSONL 协议——把 runtime 放到进程边界外](09-cli-and-protocol.md)。
+- stream=true 只改变 wire 与解析，未产生逐 token Event。
+- request_id、response_id、call_id 属于不同身份，不能混用。
+- CC 的全历史回放指 snapshot 中历史，不代表完整 wire transcript。
+- 当前代码支持 DeepSeek 不代表 doctor 已实现其分支。
 
+## 9. 本章总结
+
+Provider 的工作是协议翻译、HTTP 控制与 metadata；Tool 执行和状态记账仍由 Harness 掌握。
+
+## 10. 自测问题
+
+1. native ID 为什么需要映射？参考：服务端要求原 call ID，内部 ID 使用自身类型。
+2. attempts Vec 会自动写事件吗？参考：实际由 observed+ack 路径写，默认 Provider 不报告。
+3. SSE 是否让 UI 实时显示 token？参考：当前不会，先收完整 body。
+4. CC 是否完整保留工具 arguments？参考：history 不保留，回放合成 `{}`。
+5. model override 哪条路径生效？参考：Responses；CC 当前仍用 config。
+
+## 11. 下一章如何衔接
+
+模型提出建议以后，接下来读[Tool 系统](04-first-tool.md)，看 JSON 参数怎样变成能力请求。
+
+---
+
+导航：上一章 [第 5 章：AgentLoop 的完整实现](05-agent-loop.md) · [首页](README.md) · 下一章 [第 7 章：Tool 系统](04-first-tool.md)

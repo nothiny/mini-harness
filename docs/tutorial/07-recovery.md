@@ -1,160 +1,162 @@
-# 第 7 章：崩溃恢复——系统怎样面对“不知道”
+# 第 12 章：崩溃恢复、Checkpoint 与未知副作用
 
-前几章已经有 durable event log，也能取消进程。现在考虑一个无法回避的时刻：
+## 1. 本章解决什么问题
 
-~~~text
-tool.started
-进程崩溃
-没有 tool.completed
-~~~
+edit 已 rename 成功，但 Harness 在追加 ToolCompleted 前崩溃。日志只有 ToolStarted；重新执行可能再次修改文件。如何重建状态，又不假装知道外部操作的结果？
 
-本地日志只能证明工具开始了，不能证明外部世界最后发生了什么。当前项目没有假装自己拥有 exactly-once，而是把这种窗口明确表示为 OutcomeUnknown，并交给恢复流程分类。
+## 2. 先理解设计思想
 
-## 恢复的三个动作
+恢复分三件事：repair 找回完整日志边界；replay 重建内存；classify/report 说明未完成工作。Checkpoint 是派生快照，recover 是保守记账，resume 是重建对象；它们都不是从上次机器指令自动续跑。
 
-打开 src/durable/recovery.rs。恢复流程只做三件事：
+## 3. 模块在整体架构中的位置
 
-1. 读取并重放已有事件；
-2. 生成 RecoveryFinding；
-3. 在显式 recover 命令中追加恢复事实和 action required。
+```mermaid
+flowchart LR
+    LOG[JSONL log] --> REP[repair_partial_tail]
+    REP --> CP[Checkpoint read/验证]
+    CP --> STATE[replay state]
+    CP -->|坏或缺失| FULL[full replay]
+    FULL --> STATE
+    STATE --> CLASS[classify_state]
+    CLASS --> REPORT[RecoveryReport]
+    REPORT --> REC[recover_store: 追加保守事实]
+    REC --> HUMAN[检查文件/hash/外部系统并决定]
+    HUMAN --> AB[abandon_turn 或批准可批准调用]
+```
 
-它不会执行 read、edit、bash，也不会自动重新发送 provider 请求。
+## 4. 源码位置
 
-这条边界很重要。恢复代码运行时，外部世界可能已经改变；它只能解释日志，不能凭空确认副作用是否发生。
+- [recovery.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/recovery.rs)：classify_events、classify_state、inspect_store、recover_store、policy_for_tool、abandon_turn。
+- [checkpoint.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/checkpoint.rs)：Checkpoint::read/write_atomic、create_checkpoint、replay_from_checkpoint、replay_with_checkpoint_fallback。
+- [agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop_setup.rs)：restore、restore_with_checkpoint、from_state。
+- [event_log.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/event_log.rs)：repair_partial_tail。
+- [tests/recovery_classify.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/recovery_classify.rs)、[tests/recovery_cli.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/recovery_cli.rs)、[tests/checkpoint.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/checkpoint.rs)。
 
-## RecoveryFinding 的含义
+## 5. 从入口逐步分析源码
 
-当前实现可能报告：
+### 5.1 崩溃时日志可能停在哪里
 
-| Finding | 日志说明 |
-|---|---|
-| ActiveTurn | turn 没有到达终态 |
-| PendingModelResponse | 模型请求可能在进程停止时仍未返回 |
-| PendingApproval | 工具等待用户审批 |
-| PendingTool | 工具请求已记录，但还没有开始 |
-| UnknownTool | 工具可能已经产生副作用，但结果没有 durable |
+| 日志尾部 | 能知道什么 | classify_state finding |
+|---|---|---|
+| TurnStarted，无模型文本 | 一轮已开始，模型阶段未有可靠响应 | ActiveTurn + PendingModelResponse |
+| ToolRequested，无 Started | 请求已接受，尚无开始事实 | PendingTool + 保守 policy |
+| ToolApprovalRequested | 已持久化等待人类 | PendingApproval 优先 |
+| ToolStarted，无结果 | 进入副作用窗口，外部结果不确定 | UnknownTool，带 ExecutionId |
+| ToolOutcomeUnknown | 已显式确认缺乏可靠结果 | UnknownTool，execution_id=None |
+| 工具已完成、Turn 无终态 | 工具结果知道，Turn 未结束 | 至少 ActiveTurn |
+| TurnCancelled/Completed/Failed/TimedOut | active_turn 已清空 | 当前 classifier 可 clean |
 
-PendingTool 和 UnknownTool 不同：
+PendingModelResponse 由 last_model_response 是否 None 推断，不是“每一次模型请求都有 durable started ID”的精确探测；最后一轮采样也可能仅留下 ActiveTurn。classifier 只看重建的 active Turn，不重新审计所有过去终态工具窗口。
 
-~~~text
-tool.requested
-  └─ PendingTool：可能尚未启动
+### 5.2 inspect 与 recover 的执行步骤
 
-tool.requested → tool.started
-  └─ UnknownTool：已经进入执行窗口
-~~~
+库 inspect_store 读取 EventSeq(1)，classify_events 逐条 reduce，最后 classify_state；不执行工具。CLI open_referenced_log 在此之前可 repair 半行，因此 CLI inspect 不是严格零写入的字节操作。
 
-恢复系统会为工具选择保守策略：
+recover_store 先读取/分类。clean 直接返回；同 Turn 已有 recovery completed marker 则不重复批次。没有开放 recovery batch 时写 RecoveryStarted，然后处理每个 finding：
 
-- read → RetryRead；
-- edit → InspectEditHash；
-- 其他工具，例如 bash → RequireUserDecision。
+- Running unknown：先写 ToolOutcomeUnknown，原 Running 转 Unknown；再 ActionRequired。
+- 已 Unknown、PendingTool、PendingApproval、PendingModelResponse：必要时只写 ActionRequired。
+- 只有 ActiveTurn finding：写无 call 的 ActionRequired。
 
-RecoveryPolicy 描述下一步该怎样处理，不代表系统已经替你处理了。
+ActionRequired 的 call/policy 去重，最后写 RecoveryCompleted，再重新 inspect。`recovery.completed` 意味着**分类记账完成**，不是业务 Turn 完成；action_required 仍可 true。
 
-## inspect 和 recover 的区别
+policy_for_tool 按名字：read→RetryRead，edit→InspectEditHash，其他→RequireUserDecision。这些只是建议枚举；recover 不会自动重读、查 hash、重跑 bash。新 Tool 若有读语义也不会自动获得 RetryRead，除非扩展这个映射。
 
-CLI 的 inspect 只读：
+### 5.3 一次编辑故障时间线
 
-~~~text
-读日志 → replay → classify_state → 打印 RecoveryReport
-~~~
+```mermaid
+sequenceDiagram
+    participant L as AgentLoop
+    participant S as EventStore
+    participant E as edit executor
+    participant R as 新进程 recovery
+    participant U as 使用者
+    L->>S: ToolRequested 与 ToolStarted
+    L->>E: edit_file_with_cancel
+    E->>E: 检查 hash，写临时文件，rename
+    Note over L,E: 文件已变，ToolCompleted 尚未写，进程崩溃
+    R->>S: read/replay
+    S-->>R: Running execution
+    R-->>U: UnknownTool + InspectEditHash
+    U->>R: recover
+    R->>S: RecoveryStarted、ToolOutcomeUnknown、ActionRequired、RecoveryCompleted
+    Note over U,E: 用户检查真实文件和预期内容/hash
+    U->>R: abandon-turn（若决定放弃）
+    R->>S: TurnFailed
+```
 
-recover 会追加事实：
+rename 的原子性说明文件内容通常是旧版或新版；它不能回答事件没写时究竟是哪一版，也不能让外部副作用恰好一次。bash 可能部分执行多个动作；工具返回 error 也不必然证明什么都没做。
 
-~~~text
-recovery.started
-tool.outcome_unknown（如果有已经开始的工具）
-recovery.action_required
-recovery.completed
-~~~
+abandon_turn 先 inspect，要求给定 TurnId 正是 active Turn，写 TurnFailed，不撤销文件、不删除历史。之后新 UserInputRecorded 可把 Failed 迁移回 Idle。Unknown 不能通过 approve_tool 强行启动：该 API 要 Pending approval，并且 ToolStarted 要 Pending execution。
 
-recover 本身要幂等。重复运行时，不能每次都追加一套新的 recovery 事件。当前代码会检查已有 recovery batch 和 completed 事实。
+### 5.4 Checkpoint 如何创建
 
-abandon-turn 是人的显式决定。它追加 turn.failed，并让会话可以继续接受新的输入。恢复系统负责发现问题，人负责决定是否放弃。
+create_checkpoint(store,state,path) 检查 store seq。相等则追加 CheckpointCreated；若 store 只领先一条且恰好是同 Session 的 checkpoint marker，复用它（处理上次 marker durable、快照失败的窗口）。否则拒绝不同步。
 
-## 先手工想象三种日志尾部
+在 state 副本 reduce marker，Checkpoint::from_state 包 session_id/last_seq/state/schema=2/created_at/state_digest。digest 把 JSON 对象 key 排序后做 SHA-256，避免 HashMap 迭代顺序影响摘要。digest 是一致性检查，不是签名认证。
 
-~~~text
-A:
-tool.requested
-<EOF>
-→ PendingTool
+write_atomic 对 checkpoint path 文件锁串行写，create_new 临时文件、size<=16 MiB、write/flush/sync_all、rename。失败尽力删除临时文件；没有普遍同步 parent directory。marker 先 durable，快照后写，崩溃中间仍可回退日志。
 
-B:
-tool.approval.requested
-<EOF>
-→ PendingApproval
+Loop.create_checkpoint 最后把内存 state 更新到 marker 后状态；协议 pump 通过 Actor 发 Checkpoint，避免辅助任务自行 append 干扰单写者。
 
-C:
-tool.started
-<EOF>
-→ UnknownTool
-~~~
+### 5.5 恢复为什么仍必须相信日志
 
-读 src/durable/recovery.rs 的 classify_state，观察它是如何从 TurnState.executions、approvals 和 tool_names 推导这些 finding 的。分类本身是纯函数，不读文件，也不调用 executor。
+Checkpoint::read 检查 schema 1/2、状态与 envelope 的 ID/seq 一致、重建 history_bytes、摘要。v1 可规范化缺少的 continuation/tool_inputs；读本身不迁移写文件，成功 restore_with_checkpoint 才可写升级快照。当前空 digest 会用重新计算值填补，不能把 digest 检查单独当成防篡改证明。
 
-## checkpoint 是缓存，不是事实
+replay_from_checkpoint 实际执行：
 
-打开 src/durable/checkpoint.rs。Checkpoint 包含：
+1. read checkpoint，确认 store_last_seq>=checkpoint.last_seq。
+2. **读取全部日志**，找到 marker 的位置，验证 session/无 Turn/CheckpointCreated。
+3. 从空 SessionState **reduce 整个 marker 前缀**，要求 replayed==checkpoint.state。
+4. 取快照 state，再 reduce marker 后缀。
 
-- schema_version；
-- session_id；
-- last_seq；
-- reducer state；
-- state_digest。
+因此当前 Checkpoint 结构支持“快照+后缀”的接口，但冷启动还重放前缀作可信性验证，不能承诺减少主要重放成本或 O(suffix) 启动。原教程“跳过前缀”已修正；future 若优化需另有可信前缀校验设计。
 
-它的作用是跳过很长日志的前缀。恢复时仍然要验证：
+replay_with_checkpoint_fallback 在任意快照错误时尝试全日志；坏日志本身不能被快照掩盖。restore/restore_with_checkpoint 最后检查 state.last_seq==store.last_seq，再 from_state。恢复 active Turn 时 fresh Instant、steps=0、tool_time_used=0，停机时间和旧预算不继续累计。
 
-~~~text
-checkpoint 的 session_id 正确
-checkpoint 的 last_seq 存在于日志前缀
-checkpoint marker 与快照相符
-state_digest 能重新计算出来
-后续事件可以继续 reduce
-~~~
+### 5.6 恢复的明确限制
 
-任何校验失败，replay_with_checkpoint_fallback 都应该从 event log 全量重放。删除或损坏 checkpoint 不应改变最终状态，只会变慢。
+resume 只还原 state，不自动 sample；recover 只记保守事实，不自动 retry。Actor queue 的输入文本 replay，预分配 Turn ID/waiters 不还原。跨进程 cancel 若已写终态，classifier 可能 clean，不能保证发现所有历史 OS 副作用窗口。OutcomeUnknown 没有一个通用“人工已确认结果”的新事件/API；通常需检查后 abandon 或设计新的恢复协议。
 
-创建 checkpoint 时，marker 由 session actor 追加，快照文件通过临时文件、flush、sync 和 rename 原子替换。这样事件序列不会被旁路 writer 插入，也不会留下一个已经领先日志的快照。
+## 6. 完整运行示例
 
-## restore 如何重建 AgentLoop
-
-src/runtime/agent_loop_setup.rs 中有两条路径：
-
-- restore：从头读取事件并 reduce；
-- restore_with_checkpoint：优先使用 checkpoint，校验失败时回退全量 replay。
-
-两条路径最后都必须确认 state.last_seq 与 store.last_seq 一致。恢复成功后的 AgentLoop 拥有新的内存状态，但事实仍然来自原来的日志。
-
-注意预算的语义：重启后的 turn 会获得新的运行时预算，原来的 turn_steps 和 tool_time_used 不直接从进程内计时器恢复。durable 事实恢复了状态，实时计时器需要重新开始。
-
-## 读测试
-
-~~~bash
+```bash
 cargo test --test recovery_classify
 cargo test --test recovery_cli
 cargo test --test checkpoint
+cargo test checkpoint_round_trips_and_replays_later_events
 cargo test repair_partial_tail
-~~~
+```
 
-重点关注：
+recovery_cli 组在临时日志构造 ToolStarted 尾部，实际运行 inspect/recover/abandon-turn，断言 UnknownTool、保守 policy、Unknown 事件与 Failed 状态。它是故障日志 fixture，不假称测试真的在 rename 窗口 kill 了进程。Checkpoint 模块内测试覆盖损坏/不一致/legacy/marker 重试。
 
-- 五种 finding 是如何构造的；
-- recover 第二次运行为什么不重复追加；
-- 损坏 checkpoint 为什么回退；
-- 半行修复为什么只允许操作最后一行；
-- inspect 输出为什么要脱敏工具输入。
+## 7. 为什么这么设计
 
-## 思考题
+盲目把未知当失败并重试，对发消息、转账、追加记录等操作可能造成重复。显式 Unknown 增加人类处理成本，却不伪造 certainty。Checkpoint 便于快照兼容与校验，但当前严格验证牺牲冷启动加速；日志仍是唯一退路。
 
-1. 为什么恢复流程不能自动重试 read，即使 read 通常没有副作用？
-2. tool.started 后没有结果时，为什么不能直接记录 tool.failed？
-3. checkpoint 损坏时全量 replay 能恢复什么，不能恢复什么？
-4. recovery.completed 为什么需要成为事实，而不能只在 CLI 返回成功？
-5. 如果工具是“发送邮件”，policy_for_tool 应该返回什么？
-6. abandon-turn 之后，为什么新的 user.input.recorded 可以把会话从 Failed 拉回 Idle？
-7. 如果 checkpoint 写入失败但 marker 已追加，下一次创建 checkpoint 应该怎样处理？
+## 8. 常见误解
 
-下一章：[真实 provider——Responses 与 Chat Completions](08-openai-provider.md)。
+- RecoveryCompleted 不是 TurnCompleted。
+- RetryRead 枚举不是已经调用 ReadTool。
+- Checkpoint 删除可以回退，但 event log 损坏不能靠任意快照免检继续。
+- 普通工具 Err 也可能伴随部分副作用；Unknown 表示缺可靠结果，而非副作用是否发生的唯一判断。
 
+## 9. 本章总结
+
+恢复保留可证明事实，并把未证明的现实结果留给显式决策。它恢复的是状态与证据，不是自动恢复所有执行进度。
+
+## 10. 自测问题
+
+1. Started 后无 Completed 为什么不能宣称未执行？参考：外部动作可能已发生。
+2. recover read 会重读吗？参考：不会，只记录 RetryRead 建议。
+3. 快照摘要为何 key 排序？参考：不同 map 顺序应有相同 canonical digest。
+4. 当前 Checkpoint 是否跳过前缀计算？参考：不会，前缀重放验证后才应用后缀。
+5. abandon 有什么副作用？参考：写 TurnFailed，释放 active Turn；不回滚真实文件。
+
+## 11. 下一章如何衔接
+
+下一章讲[Policy 与安全边界](policy.md)，把执行前审批与执行后未知结果的决策明确区分。
+
+---
+
+导航：上一章 [第 11 章：进程管理、输出与取消](06-process-cancellation.md) · [首页](README.md) · 下一章 [第 13 章：Policy、审批与安全边界](policy.md)

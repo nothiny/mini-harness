@@ -1,197 +1,141 @@
-# 第 2 章：EventStore 和 reducer——日志怎样变成状态
+# 第 9 章：Event Sourcing、EventStore 与 Reducer
 
-第 1 章介绍了事件的形状。这一章追问：事件写在哪里？重启后，系统怎样知道当前会话进行到哪一步？
+## 1. 本章解决什么问题
 
-当前项目把答案拆成两个模块：
+进程重启后，怎样知道用户说了什么、工具是否完成、是否还待审批？只存“status=Running”不能回答这些问题。本章从 11 条 read 事件演算当前状态，再追到磁盘。
 
-- EventStore 负责保存和读取事件；
-- reducer 负责把事件应用到 SessionState。
+## 2. 先理解设计思想
 
-这两个模块分开，是整个恢复能力的基础。
+事件是过去发生的事实，状态是事实累计后的当前视图。事件溯源让日志成为事实来源，reducer 重放同样序列得到同样状态。它并不表示只要 JSON 能解码就合法，也不表示原始日志可任意改写。
 
-## 先看三个真实文件
+## 3. 模块在整体架构中的位置
 
-按这个顺序打开源码：
+```mermaid
+flowchart LR
+    P[运行行为] --> AP[AgentLoop::append]
+    AP --> CL[clone old state]
+    CL --> VR[reduce 候选状态]
+    VR --> W[EventStore::append]
+    W --> COMMIT[提交 next_state]
+    LOG[完整事件日志] --> RP[逐事件 reduce]
+    RP --> ST[SessionState]
+    LOG --> CP[Checkpoint 验证]
+```
 
-1. src/runtime/state.rs：SessionState、TurnState、HistoryItem；
-2. src/durable/reducer.rs：reduce；
-3. src/durable/store.rs、src/durable/memory.rs、src/durable/event_log.rs：EventStore 及实现。
+## 4. 源码位置
 
-不要一开始读 event_log.rs 的所有文件锁和缓存。先理解下面的纯数据流：
+- [event.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/event.rs)：事件版本、编码、kind。
+- [store.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/store.rs)、[memory.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/memory.rs)：EventStore 与内存实现。
+- [event_log.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/event_log.rs)：JsonlEventStore、append、read_all_locked、validate_suffix、repair_partial_tail。
+- [reducer.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/reducer.rs)：reduce、active_turn_mut、push_history。
+- [agent_loop.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop.rs)：append。
+- [src/lib_tests.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/lib_tests.rs)、[tests/property_replay.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/property_replay.rs)、[tests/jsonl_cross_process.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/jsonl_cross_process.rs)、[tests/reducer_turn_terminal.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/reducer_turn_terminal.rs)。
 
-~~~text
-事件日志
-  └─ Event 1
-  └─ Event 2
-  └─ Event 3
-       │
-       ▼
-reduce(state, event)
-       │
-       ▼
-SessionState
-  ├─ status
-  ├─ active_turn
-  ├─ history
-  ├─ pending_inputs
-  ├─ provider_continuation
-  └─ last_seq
-~~~
+## 5. 从入口逐步分析源码
 
-SessionState 是“从日志计算出来的当前视图”。它很重要，但它不是唯一事实。进程崩溃后，runtime 可以重新从事件构造它。
+### 5.1 从一张空表开始逐事件演算
 
-## SessionState 里最值得先读的字段
+设用户 U=`read a.txt`，工具 C 读到 hello，最终文本 F=done；表中 C/T 是同一个实际 call/turn ID 的缩写，不是可传给解析器的字符串。事件顺序来自 `full_mock_read_turn`：
 
-src/runtime/state.rs 中的 SessionState 有几个字段：
+| seq / 事件 | 前置条件 | 本步状态变化 |
+|---|---|---|
+| 1 SessionCreated | last_seq=0、无 turn_id | status=Idle，history=[]，pending=[] |
+| 2 UserInputRecorded(U) | 无 active_turn、Idle | history=[User(U)]，pending=[U] |
+| 3 TurnStarted(T) | pending 非空、无 active | pending=[]，active=T/Running，status=Running |
+| 4 ProviderContinuationUpdated(mock cursor=1) | T active、cursor<=history.len | 保存 continuation，不加 history |
+| 5 ModelResponseRecorded(tool call: read) | T active | last_model_response=摘要；history 加 Assistant |
+| 6 ToolRequested(C,read,input) | C 尚不存在 | tool_calls=[C]；保存 name/input；execution[C]=Pending |
+| 7 ToolStarted(C,E) | Pending 且无待批准/拒绝 | execution[C]=Running(E) |
+| 8 ToolCompleted(C,result) | Running | execution[C]=Completed；history 加 Tool(C,read,result) |
+| 9 ProviderContinuationUpdated(None) | T active | 清除 continuation |
+| 10 ModelResponseRecorded(F) | T active | last_model_response=F；history 加 Assistant(F) |
+| 11 TurnCompleted(F) | 所有 executions=Completed | active_turn=None，status=Idle；F 与上条一致，不重复加 history |
 
-| 字段 | 含义 |
-|---|---|
-| session_id | 这份状态属于哪个会话 |
-| status | Idle、Running、Failed 或 Closed |
-| active_turn | 当前是否有正在处理的 turn |
-| history | 给后续模型请求使用的对话历史 |
-| pending_inputs | turn 运行时排队的用户输入 |
-| provider_continuation | 下一次 provider 请求需要的续传信息 |
-| last_seq | 已应用到状态的最后一条事件序号 |
+每一步成功后 last_seq 变为该行 seq。最终 history 是 User、工具摘要、工具结果、最终文本四项。工具表只在 active Turn 中；终态清空 active_turn 后，历史事实仍在日志里。
 
-TurnState 再记录某一轮内部发生的事情：模型最近的响应、工具调用 ID、每个工具的 ExecutionState、审批状态和最终文本。
+### 5.2 reducer 的输入、合法性与失败语义
 
-注意“当前有几个工具正在运行”没有单独存成一个事实字段。它由 active_turn.executions 中的 Running 状态推导出来。
+`reduce(&mut SessionState, &Event) -> Result<(),HarnessError>` 不调用 Provider、Executor、时钟或随机数。首先检查同一 session、seq 恰好 last_seq+1、首事件必须 SessionCreated、SessionCreated 只能一次。`active_turn_mut` 检查 Turn 存在且 event.turn_id 匹配。
 
-## reducer 既是更新器，也是验证器
+事件分支同时更新与校验：ToolRequested 不可重复；ToolStarted 必须 Pending 且批准状态允许；ToolCompleted 必须 Running；ToolFailed 可以从 Pending/Running；ToolOutcomeUnknown 只能从 Running。TurnCompleted 要求全部工具 Completed，不能用失败工具的结果装作成功。
 
-打开 src/durable/reducer.rs 的 reduce。它一开始就做三类检查：
+ApprovalRequested 要 Pending tool，ApprovalResponded 要已有 Pending approval。PolicyDenied 不写 approvals，防止把程序决策伪造成人类回应。Recovery/Checkpoint 生命周期事件没有 TurnId；ActionRequired 则关联 active Turn 与未完成 call。
 
-~~~text
-1. event.session_id 必须等于 state.session_id
-2. event.seq 必须等于 state.last_seq + 1
-3. 空状态的第一条事件必须是 SessionCreated
-~~~
+push_history 使用 JSON 编码字节计数，硬上限 1 MiB。最后才更新 last_seq。**reduce 不承诺对所有 Err 原地回滚**：一些分支可能先改 map 再遇到后续错误；安全 runtime 在 clone 上预验证，失败即丢掉副本。读者不要直接对共享真实状态反复试非法事件。
 
-然后它按 EventPayload 分支处理。例如：
+### 5.3 EventStore 接口与职责差别
 
-- UserInputRecorded 把用户输入写进 history，并加入 pending_inputs；
-- TurnStarted 从 pending_inputs 取出一条，创建 active_turn；
-- ToolRequested 创建 Pending execution；
-- ToolStarted 把 Pending 变成 Running；
-- ToolCompleted 把 Running 变成 Completed，并把工具结果放进 history；
-- TurnCompleted 关闭 active_turn；
-- TurnFailed、TurnCancelled 和 TurnTimedOut 结束当前 turn。
+append 返回最终 Event，因为 store 分配 seq；read_from 是包含传入序号的读取，last_seq 给当前尾部。InMemory 用 Arc<Mutex<Vec>>，追加只分配连续 seq，**不负责完整 reducer 预验证**。适合受 loop 约束的测试，不能当通用合法事件防火墙。
 
-这些分支同时验证状态迁移是否合法。因此以下事件顺序会被拒绝：
+JSONL 每行一个 Event 并以换行结尾。`read_all_locked` 检查大小<=128 MiB、行数<=1,000,000、无空行、UTF-8/JSON/schema 正确、序号连续、同 Session，再 reduce 全部事件。合法 JSON 但非法 ToolCompleted 顺序仍算 Corrupt。
 
-~~~text
-ToolCompleted 出现在 ToolStarted 之前
-同一 call_id 被完成两次
-TurnCompleted 时仍有 Running 工具
-另一个 session 的事件混进来
-seq 从 41 跳到 43
-~~~
+### 5.4 JsonlEventStore::append 的真实步骤
 
-严格拒绝的好处是：恢复时不需要猜日志作者想表达什么。一个能被打开的日志就是一个通过状态机检查的日志。
+调用先获取实例内 Tokio Mutex，随后获取独立 `.jsonl.lock` 文件的 fs2 exclusive lock（通过 spawn_blocking），在锁内读取并验证已有日志，分配 seq=len+1，打开 append 文件。Unix 尽力设置 log/lock mode 0600。
 
-## EventStore 的两个实现
+编码 Event+换行，检查追加后总字节预算，write_all → flush；Synced 再 sync_data，Buffered 不强制设备同步。`JsonlEventStore::new` 库默认 Synced；CLI 配置默认 Buffered。sync 也不能被泛化成所有硬件/目录元数据的无条件断电保证。
 
-EventStore trait 只有三个核心操作：
+写完释放文件锁。如果 write/flush/sync 报错，代码重新读取日志按 event_id 查找：这行可能已写完整，错误返回不一定表示事实未持久化。找到它则返回保存事件，否则返回 IO 错误。
 
-~~~text
-append(event)      追加事实，并返回最终保存的事件
-read_from(seq)     从某个序号开始读取
-last_seq()         查询最后一个序号
-~~~
+成功后在 cached state 上 reduce 新事件；如果失败，只使 cache 失效，**事件已经写入了**。因此 JsonlEventStore.append 也不对新 payload 提供全套先验证承诺；调用方应该先 reduce，下一次 read 会发现非法完整日志。用户扩展 Store 或写恢复事件必须保持这个责任边界。
 
-InMemoryEventStore 把事件放在 Vec 中，适合测试和 demo。JsonlEventStore 把每个事件写成一行 JSON，适合持久化会话。
+### 5.5 Actor、Mutex、file lock 和 seq 检查各保护什么
 
-两者对调用方提供同一套语义，但职责不完全相同：
+Actor/独占 loop 借用保护整个会话迁移的顺序；store Mutex 串行同实例 append；fs2 advisory lock 协调遵守协议的多个进程；seq 预检查及返回检查发现内存已落后。只有文件锁，并不能让两份 SessionState 同时驱动同一会话；`store.last_seq` 检查与 `append` 之间也不是数据库 CAS。
 
-- AgentLoop 在 append 前会计算自己期待的序号，并检查 store.last_seq；
-- EventStore 在自己的锁内重新分配最终 seq；
-- AgentLoop 检查 store 返回的 seq 是否与期待值一致；
-- JsonlEventStore 负责文件锁、半行检测、大小上限和缓存。
+### 5.6 cache 与 suffix validation
 
-这也是为什么 EventStore::append 返回 Event，而不是只返回成功或失败。
+LogCache 保存 len/mtime 指纹、完整 events、已验证 byte offset、reducer state。文件未变化直接用 cache；变长且可认定 append-only 时 validate_suffix 从 offset 读取新行、检查 seq/session、在缓存状态上 reduce。缩短、尾部半行等走 full read。
 
-## JSONL 为什么选择“一行一个事件”
+这在协作写入前提下减少反复全量验证；cache 仍复制 events/state，不能据此承诺所有操作 O(1)，len/mtime 也不是防恶意篡改认证。历史改写可能破坏 cursor、checkpoint 和复现；显式 schema migration 验证后原子改写版本标记，payload 语义保持，不能借 migration 修改事实。
 
-JSONL 的每一行都是一个可以独立解析的 Event。它有几个直接好处：
+### 5.7 Replay 和半行修复
 
-- 追加新事件很简单；
-- 崩溃后可以定位最后一行；
-- 读日志时可以逐行验证；
-- shell 和普通工具容易观察；
-- 读取路径可以报告具体行号。
+restore 以 SessionState::new 开始按 seq reduce。中间损坏完整行不能猜测丢弃；缺末尾换行时 read 报 Corrupt。repair_partial_tail 在 exclusive lock 内截到最后完整换行，sync_data 并清 cache；它只按换行判断完整行，不会修复一个带换行的坏 JSON。
 
-当前 JsonlEventStore 对文件有严格规则：
+CLI inspect/recover/resume 等入口会先调用 repair，所以虽然 inspect 不追加恢复事件，它可能修理末尾半行；库 inspect_store 则只读。这是“只读分类”和“CLI 便利修复”的重要差别。
 
-1. 空文件可以打开；
-2. 完整行必须能解析成 Event；
-3. 文件末尾没有换行时，读取报半行损坏；
-4. 中间损坏行不能自动修复；
-5. 每行 seq 必须与行号一致；
-6. 超过事件数量或总字节上限要拒绝。
+## 6. 完整运行示例
 
-半行修复是显式命令 repair_partial_tail 的工作。读取时静默丢掉最后半行，会把“崩溃残留”误当成“没有发生过”。
-
-## 一次 append 的事务顺序
-
-src/runtime/agent_loop.rs 中的 append 是理解整个 runtime 的关键函数。它大致这样工作：
-
-~~~text
-旧 state
-  │
-  ├─ 计算 expected_seq
-  ├─ 检查 store.last_seq
-  ├─ 组装 event，检查事件大小
-  ├─ clone 出 next_state
-  ├─ reduce(next_state, event)
-  │       └─ 失败：不写盘
-  ├─ store.append(event)
-  │       └─ 失败：状态不提交
-  ├─ 检查 store 返回的 seq
-  └─ self.state = next_state
-~~~
-
-“验证 → 持久化 → 提交”这条顺序解决两个风险：
-
-- 非法事件不会污染日志；
-- 内存状态不会领先于持久化事实。
-
-但它不能让外部世界拥有 exactly-once 语义。文件已经改了、进程已经发出网络请求，随后日志追加失败，这个窗口会在第 7 章讨论。
-
-## 用测试观察重放
-
-运行：
-
-~~~bash
+```bash
+cargo test reducer_replay_is_deterministic
 cargo test jsonl_rejects_sequence_gaps_and_middle_corruption
-cargo test jsonl_rejects_partial_tail
-cargo test reducer_allows_recovery_input_after_failure_but_not_close
 cargo test --test property_replay
-~~~
+cargo test --test jsonl_cross_process
+cargo test --test reducer_turn_terminal
+```
 
-阅读 property replay 测试时，关注两个断言：
+property 组生成固定种子的 Mock 脚本，重放每个 prefix/两次完整日志并比较；它没有使用 proptest，也不覆盖所有理论事件序列。cross-process 组检查 suffix 计数与半行修复后重新验证。对 read Demo 可按本章表手工演算，结果应和 Session.state 相等。
 
-- 同一事件序列重复 reduce，结果完全相等；
-- 非法序列会返回错误，而不是 panic。
+## 7. 为什么这么设计
 
-这两个性质分别对应“可恢复”和“可诊断”。
+日志保留因果关系，状态可重建；reducer 纯逻辑让恢复和执行共享规则。代价是额外编码、clone、日志增长、schema 兼容成本；当前不支持任意长 history，也没有日志压缩/历史清理协议。
 
-## 这一章读完后
+如果直接存可变 SessionState，恢复只能看到一张最后快照，无法分辨审批、人类拒绝和策略拒绝，更无法明确工具“开始了但结果未记账”的窗口。
 
-你应该能从一条事件回答：
+## 8. 常见误解
 
-- 它会改变 SessionState 的哪些字段；
-- 它要求当前状态满足什么前置条件；
-- 它能否被重放；
-- 它失败时应该阻止追加，还是生成一个终态事件。
+- EventStore 不是 reducer：存得下不等于状态转移合法。
+- `tool.started` 证明进入执行窗口，不证明副作用一定发生或完成。
+- replay 重建状态，不重放 OS 操作。
+- append 事务不包含文件 rename 或 HTTP 副作用。
 
-## 思考题
+## 9. 本章总结
 
-1. 如果 reducer 在处理 ToolCompleted 时读取当前文件内容，会破坏什么性质？
-2. 为什么 JsonlEventStore 不能在读取时自动丢掉末尾半行，却可以提供单独的 repair_partial_tail？
-3. 如果 append 已经把事件写入文件，但进程在 self.state = next_state 之前崩溃，重启时会发生什么？
-4. 为什么 SessionState 的 pending_inputs 要从事件推导，而不是只存在 actor 的 VecDeque 中？
-5. 你会把 checkpoint 当成事实，还是当成缓存？如果 checkpoint 损坏，正确的退路是什么？
+日志是事实，reducer 是验证与演算规则，内存 state 是结果。理解这三个角色，才能解释所有恢复结论的依据。
 
-下一章：[MockProvider、Session 和 actor](03-mock-provider-and-session.md)。
+## 10. 自测问题
 
+1. seq=8 直接跟 seq=6 可接受吗？参考：不可，必须连续。
+2. reducer 可否读取现有文件决定结果？参考：不可，会破坏确定重放。
+3. sync 出错为何按 EventId 重读？参考：错误时该行可能已经 durable。
+4. memory store append 会验证工具顺序吗？参考：不会，Loop 负责预验证。
+5. 修改历史 ToolCompleted 有什么后果？参考：重放事实改变、快照不匹配、因果与审计不再可靠。
+
+## 11. 下一章如何衔接
+
+下一章讲[Session Actor 与并发](session-actor.md)，解释谁有权执行这些状态迁移。
+
+---
+
+导航：上一章 [第 8 章：Executor 系统与副作用边界](executor.md) · [首页](README.md) · 下一章 [第 10 章：Session Actor 与并发](session-actor.md)
