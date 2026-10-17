@@ -145,8 +145,7 @@ async fn zero_duration_limits_disable_the_budgets() {
     ));
 }
 
-/// 累积 history 与滑动窗口后的请求使用不同的上限
-/// （ARCHITECTURE_REVIEW P0-2 的回归测试）。
+/// 累积 history 与滑动窗口后的请求使用不同的上限。
 ///
 /// durable history 超过 `max_context_bytes`（1MB）后，只要滑动窗口
 /// 裁剪出的请求仍小于限制，对话就必须能继续 —— 事件追加不得因为
@@ -164,9 +163,9 @@ async fn large_durable_history_does_not_block_small_context_requests() {
     let mut events = Vec::new();
     let mut seq = 0u64;
     let push = |turn: Option<mini_harness::runtime::TurnId>,
-                    payload: EventPayload,
-                    events: &mut Vec<mini_harness::durable::Event>,
-                    seq: &mut u64| {
+                payload: EventPayload,
+                events: &mut Vec<mini_harness::durable::Event>,
+                seq: &mut u64| {
         *seq += 1;
         let mut event = mini_harness::durable::Event::new(session, turn, payload);
         event.seq = EventSeq(*seq);

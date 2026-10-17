@@ -192,10 +192,10 @@ where
             )));
         }
         let mut next_state = self.state.clone();
-        // 注意: 这里不再检查累积 history 是否超过 `max_context_bytes`。
+        // 注意: 这里不检查累积 history 是否超过 `max_context_bytes`。
         // 那个限制属于滑动窗口后的模型请求（见 continue_turn）；累积
         // 审计历史的上限由 reducer 的 `MAX_HISTORY_BYTES` 独立保护，
-        // 两者共用一个限制会误拒长会话（ARCHITECTURE_REVIEW P0-2）。
+        // 两者共用一个限制会误拒长会话。
         reduce(&mut next_state, &event)?;
         let persisted = self.store.append(event).await?;
         tracing::debug!(

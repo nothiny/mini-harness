@@ -8,7 +8,7 @@ use crate::{
 };
 /// Durable history is bounded independently of the provider-facing context.
 ///
-/// 两层限制各司其职（见 ARCHITECTURE_REVIEW P0-2 的修复）:
+/// 两层限制各司其职:
 ///
 /// * 这里（8MB）: 累积审计历史的上限，防止一个会话快照无限增长；
 /// * `AgentLoopConfig::max_context_bytes`（1MB）: 单次模型请求的上限，
