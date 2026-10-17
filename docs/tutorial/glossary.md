@@ -1,63 +1,82 @@
-# 术语与 Rust 源码阅读提示
+# 术语表
 
-本表为正文复读入口，不替代执行故事。所有名词以提交 `1720acefc11fe38cfb9b3bb3d649832ef951d4a8` 为准。
+按主题整理。每条给出最短定义和对应的源码位置；读教程遇到不熟的词，先回这里查。
 
-## 系统与事实
+## 运行时结构
 
-| 名词 | 当前实现含义 | 阅读位置 |
+| 术语 | 含义 | 相关位置 |
 |---|---|---|
-| Harness | 模型之外的授权、执行、预算、持久化、取消、恢复与客户端边界 | [第0章](00-overview.md) |
-| Session / Turn | 长期会话 / 一次输入对应的工作；终态或审批暂停需分别判断 | [第4章](03-mock-provider-and-session.md) |
-| Step | 一次采样与响应处理；当前是计数，没有持久化Step struct | [第3章](01-ids-and-events.md)、[第5章](05-agent-loop.md) |
-| Message / ToolExecution | 教学概念；源码分别以HistoryItem与ExecutionState/TurnState表表达，无同名struct | [第3章](01-ids-and-events.md) |
-| Event / EventPayload | 事实信封（ID/seq/time/session/turn） / 具体事实内容 | [第9章](02-event-store-and-reducer.md) |
-| State / Reducer | 派生视图 / 纯粹按事件检查并更新状态的函数reduce | [第9章](02-event-store-and-reducer.md) |
-| EventId / EventSeq | 唯一事实身份 / 会话内连续顺序；不可互代 | [第3章](01-ids-and-events.md) |
-| Checkpoint | 可丢弃的派生快照；当前恢复仍重放前缀校验，不承诺O(suffix)启动 | [第12章](07-recovery.md) |
-| OutcomeUnknown | 已进入副作用窗口却无可靠结果；不等于确定失败或确定成功 | [第12章](07-recovery.md) |
-| RecoveryPolicy | RetryRead/InspectEditHash/RequireUserDecision建议，recover不自动执行它 | [第12章](07-recovery.md) |
-| exactly-once | 副作用恰好一次的保证；当前文件/命令与日志没有联合事务，不提供此保证 | [第19章](design-decisions.md) |
+| Harness | 模型循环之外的全部系统：授权、执行、持久化、恢复、协议与 UI | 第 0 章 |
+| Session | 可恢复的长期会话，包含历史、配置和多个 turn | `src/runtime/session.rs` |
+| Turn | 一次用户输入到最终回答、失败、取消或暂停 | `src/runtime/state.rs` |
+| Step | 一次模型请求及其结果处理，一个 turn 可以包含多个 step | `src/runtime/agent_loop.rs` |
+| ToolExecution | 一个具体工具调用实例，有独立 ID、状态和执行策略 | `src/runtime/state.rs` |
+| ContextSnapshot | 拥有所有权、不可变的模型输入窗口，负责预算截断 | `src/runtime/context.rs` |
+| 事实（fact） | 已经发生的事情，只追加、不修改，进入 event log | `src/durable/event.rs` |
+| 派生状态（derived state） | reducer 从事实计算出来的当前视图 | `src/durable/reducer.rs` |
 
-## 能力与控制
+## 模型与 Provider
 
-| 名词 | 当前含义 | 阅读位置 |
+| 术语 | 含义 | 相关位置 |
 |---|---|---|
-| Provider / WireStyle | 统一模型接口 / Responses或Chat Completions线上格式 | [第6章](08-openai-provider.md) |
-| Continuation | response链/cursor/native call映射与可选reasoning元数据 | [第6章](08-openai-provider.md) |
-| ContextSnapshot | 拥有数据的模型输入窗口；截断不修改日志 | [第5章](05-agent-loop.md) |
-| Tool / Spec / Context | 操作语义 / 模型schema与risk / 当次执行能力和控制参数 | [第7章](04-first-tool.md) |
-| Executor | 文件/进程能力与类型化结果；可信代码约定不是OS sandbox | [第8章](executor.md) |
-| Policy Allow/Ask/Deny | 允许尝试/持久化等待人类/程序拒绝 | [第13章](policy.md) |
-| Sandbox | OS层隔离；当前未实现，workspace只是文件能力范围与bash cwd | [第13章](policy.md) |
-| Process group / Process tree | 信号可选集合 / 父子关系；脱组后代不受原组取消保证 | [第11章](06-process-cancellation.md) |
-| Cancel / Timeout | 外部控制 / 时间预算；process timeout可以是正常ToolResult | [第11章](06-process-cancellation.md) |
-| Durable queue / Steer | 输入事实进入history和FIFO；审批暂停可影响当前Turn，执行中输入延迟确认 | [第10章](session-actor.md) |
-| Scheduler | 多SessionHandle门面，不复制历史，不自动持久化task绑定 | [第16章](11-scheduler.md) |
-| Safe projection | v2只暴露有限字段，但input_summary仍可有命令/路径片段，不是通用脱敏 | [第14章](09-cli-and-protocol.md) |
-| Execution Success / Task Correctness | 合法终态 / 独立验证满足任务；exit0与固定成功文本不足证明正确 | [第17章](config-tests-benchmarks.md) |
+| Provider | 把模型服务差异翻译成 runtime 能理解的请求和响应 | `src/model/provider.rs` |
+| ModelRequest | 一次模型请求的拥有所有权快照（历史、工具、continuation） | `src/model/provider.rs` |
+| ModelResponse | 归一化后的模型结果：文本、单个或多个工具调用 | `src/model/provider.rs` |
+| MockProvider | 按脚本返回确定性响应的 provider，也是核心设计工具 | `src/model/mock.rs` |
+| ProviderContinuation | provider 自己维护的续传数据，重启后仍可继续响应链 | `src/runtime/state.rs` |
+| Wire style | 线上格式；项目同时支持 Responses 与 Chat Completions | `src/model/openai_protocol.rs` |
 
-## 按场景理解 Rust
+## 工具、策略与执行
 
-| 机制 | 先怎样读 | 本项目中的作用与限制 |
+| 术语 | 含义 | 相关位置 |
 |---|---|---|
-| trait | 某类组件必须提供哪些能力 | ModelProvider/Executor/Tool接口；不自动保证业务契约 |
-| 泛型P/E/S | 装配时确定的具体类型 | AgentLoop静态使用组件；ConfiguredProvider枚举统一运行时选择 |
-| dyn Trait | 运行时不同实现共用接口 | Registry存Arc dyn Tool；ToolContext借用dyn Executor |
-| Arc | 多个所有者共享同一对象 | clone不是复制整份Executor；不自动允许无锁修改内部值 |
-| Mutex | 进入共享数据的短临界区或异步锁 | Mock脚本短锁、store追加锁、stdout writer锁；作用范围各不同 |
-| async/await | 一个可暂停等待的函数/future | 等HTTP/IO时让出调度；await不会自动生成线程或解除&mut借用 |
-| tokio::spawn | 独立调度拥有数据的task | Provider/Tool/readers；task不持有&mut SessionState |
-| tokio::select! | 轮询多个等待条件，选一个ready分支 | token/deadline/task/channel；biased指定优先次序，非所有使用都有biased |
-| pin! | future位置保持稳定供重复poll | Actor反复select同一loop future，仍保有可变借用 |
-| Result/问号 | Ok成功路径，Err提前交给上层 | Tool Err通常TurnFailed；ProcessResult exit7仍可Ok |
-| Option | 明确存在或缺失 | active_turn=None与status不同；continuation可None |
-| mpsc | 多发件人/单收件人长期通道 | SessionCommand、ProviderObserver；有界channel不代表所有后续Vec有界 |
-| oneshot | 一次请求的一次回复 | start ack、wait outcome、attempt持久化ack |
-| CancellationToken | 多任务可观察的协作取消信号 | clone同信号；child随父取消；cancel本身不写事件也不撤销副作用 |
-| RAII / Drop | 值释放时尽力收尾资源 | permit/锁/临时文件/进程组guard；Harness被SIGKILL时不保证Drop运行 |
-| spawn_blocking | 在线程池运行同步阻塞工作 | 文件锁/安全open syscalls，避免阻塞Tokio worker |
-| &mut / 所有权 | 同时只允许一个可变借用 | Session直接调用限制并发；Actor只能等loop future返回再追加新输入 |
+| Tool / ToolSpec / ToolContext | 工具声明、给模型的 schema、执行时的最小能力集 | `src/tools/spec.rs` |
+| RiskClass | 工具风险等级：Read / Write / Execute | `src/tools/spec.rs` |
+| PolicyDecision | 授权决策：Allow / Ask / Deny | `src/policy/mod.rs` |
+| fail-closed | 无法判断风险时默认拒绝，而不是默认放行 | `src/policy/mod.rs` |
+| Executor | 真正访问文件与进程的能力层 | `src/executor/trait.rs` |
+| LocalExecutor | 本地文件与进程实现，未来可替换为 sandbox 或远程 | `src/executor/local.rs` |
+| 进程组（process group） | 取消/超时时按进程组清理，避免遗留子孙进程 | `src/executor/process.rs` |
+| 三层输出上限 | 分别限制 stdout、stderr 和合计输出 | `src/executor/process.rs` |
+| OutcomeUnknown | 执行可能已产生副作用，但日志没有可靠结果 | `src/runtime/state.rs` |
 
-遇到语法先问“谁拥有值、谁能改、谁等待、失败交给谁”，再看其具体泛型形式；不要把语言工具误认成系统保证。
+## 持久化与恢复
 
-返回[教材首页](README.md) · [验证记录](validation.md)。
+| 术语 | 含义 | 相关位置 |
+|---|---|---|
+| Event / EventPayload | 一条事实及其内容 | `src/durable/event.rs` |
+| seq / event_id / schema_version | 会话内序号、事件自身 ID、事件格式版本 | `src/durable/event.rs` |
+| Reducer | 确定性函数 `reduce(state, event)`，不接受外部输入 | `src/durable/reducer.rs` |
+| append 事务 | 先验证、再持久化、后提交状态 | `src/runtime/agent_loop.rs` |
+| Checkpoint | 加速重放的派生快照，不是事实来源 | `src/durable/checkpoint.rs` |
+| RecoveryFinding | 恢复时对未完成工作的分类结果 | `src/durable/recovery.rs` |
+| RecoveryPolicy | 每类 finding 的保守恢复建议（重试 / 查 hash / 人工决定） | `src/durable/recovery.rs` |
+
+## 取消与并发
+
+| 术语 | 含义 | 相关位置 |
+|---|---|---|
+| CancellationToken | 随请求传播的取消信号，沿 turn → child → executor 传递 | `src/runtime/agent_loop.rs` |
+| 单写者 actor | 只有唯一写者能修改会话状态和追加事件 | `src/runtime/session_actor.rs` |
+| SessionCommand | 发给 actor 的操作请求（StartTurn、CancelTurn…） | `src/runtime/session.rs` |
+| Steer | turn 运行期间提交的新输入，按事实排队 | `src/runtime/session_actor.rs` |
+| durable 输入队列 | 排队输入先持久化再确认，崩溃后可恢复 | `src/runtime/session_actor.rs` |
+| Scheduler | 组合多个 session 的任务生命周期，不复制会话状态 | `src/scheduler/mod.rs` |
+
+## 协议与 UI
+
+| 术语 | 含义 | 相关位置 |
+|---|---|---|
+| JSONL 协议 | stdin 请求、stdout 响应与事件、stderr 诊断，一行一个 JSON | `src/protocol/jsonl.rs` |
+| response vs notification | 带 id 的命令回复，与无 id 的事件通知，必须分别路由 | `src/protocol/jsonl.rs` |
+| 安全投影 | 只向客户端暴露白名单字段，隐藏工具原始输入输出 | `src/protocol/event_projection.rs` |
+| input_summary | 给审批界面看的工具输入短摘要 | `src/protocol/event_projection.rs` |
+| Ink TUI | `ui/` 下的 TypeScript 协议客户端，UI 只消费事件 | `ui/src/client.ts` |
+
+## 明确不做的事（非目标）
+
+| 术语 | 含义 |
+|---|---|
+| exactly-once | 外部副作用不承诺恰好执行一次；宁可标记 `OutcomeUnknown` |
+| 排队输入取消 | 队列中的输入不单独取消，要么等它开始，要么 `abandon-turn` |
+| OS 级 sandbox | 路径检查不等于 sandbox；真实隔离是后续深度专题 |

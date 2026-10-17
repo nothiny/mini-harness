@@ -1,93 +1,194 @@
-# 第 4 章：Session 与生命周期
+# 第 3 章：MockProvider、Session 和 actor
 
-## 1. 本章解决什么问题
+这一章把前两章的类型和事件放进一次真实 turn。重点不是模型回答得多聪明，而是看 runtime 怎样在没有网络的情况下验证自己的语义。
 
-用户连续输入两条消息时，会产生两个 Session 还是两个 Turn？模型出错后是否必须丢弃整个会话？等待审批时，返回 Err 是否意味着 Turn 已结束？
+当前项目有两种使用 Session 的方式：
 
-## 2. 先理解设计思想
+- 直接使用 Session：适合测试、CLI 和库调用；
+- 使用 SessionHandle：背后启动 session actor，适合协议、TUI 和需要中途取消的调用方。
 
-Session 保持会话身份和跨 Turn 历史，AgentLoop 负责执行一轮的采样/工具闭环。直接 `Session` 是轻量 facade，Actor-backed `SessionHandle` 是并发命令入口。两者最终驱动同一种 loop，不是两套状态机。
+## 先看 Provider trait
 
-## 3. 模块在整体架构中的位置
+打开 src/model/provider.rs。最重要的类型是：
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Running: UserInputRecorded 与 TurnStarted
-    Running --> Idle: TurnCompleted / TurnCancelled / TurnTimedOut
-    Running --> Failed: TurnFailed
-    Failed --> Idle: 新 UserInputRecorded
-    state Running {
-        [*] --> Sampling
-        Sampling --> WaitingApproval: ToolApprovalRequested
-        WaitingApproval --> Executing: 批准
-        Executing --> Sampling: ToolCompleted
-    }
-```
+~~~text
+ModelRequest
+  ├─ model
+  ├─ system_instructions
+  ├─ history
+  ├─ tools
+  └─ continuation
 
-外层对应 SessionStatus；内层是教学行为阶段，不是该枚举的新成员。Unknown outcome 可能保留 Running/active_turn，不能画成必然终态。
+ModelResponse
+  ├─ Text
+  ├─ ToolCall
+  ├─ ToolCalls
+  └─ TextWithToolCalls
 
-## 4. 源码位置
+ModelProvider
+  └─ complete(request, cancel) -> ModelResponse
+~~~
 
-- [session.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/session.rs)：Session、SessionHandle、spawn_actor、start_turn、resume。
-- [agent_loop.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop.rs)：begin_turn、begin_queued_turn、cancel_turn。
-- [agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/runtime/agent_loop_setup.rs)：new_with_config、from_state、restore。
-- [reducer.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/src/durable/reducer.rs)：输入和 Turn 终态分支。
-- [tests/checkpoint.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/checkpoint.rs)、[tests/session_cancel.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/session_cancel.rs)、[tests/policy.rs](https://github.com/nothiny/mini-harness/blob/1720acefc11fe38cfb9b3bb3d649832ef951d4a8/tests/policy.rs)。
+Provider 只负责把请求送给模型并把响应翻译成统一类型。它不应该：
 
-## 5. 从入口逐步分析源码
+- 直接修改 SessionState；
+- 直接追加事件；
+- 直接执行工具；
+- 决定一个工具是否有权限执行。
 
-`Session::new/new_with_policy/new_with_policy_and_config` 创建 AgentLoop；new 并不立即写 SessionCreated，首次 begin_turn 才写。协议 create 是例外：它主动保存 SessionCreated 后再 restore Actor，因此无输入也已有 durable identity。
+这些行为属于 runtime、policy 和 executor。
 
-`Session::start_turn(&mut self, input)` 只是 `self.loop_.run_turn(input).await`。`&mut` 表示独占可变借用；while await，这个 Session 不能被另一个调用方同时借用来 cancel。需要中途控制，应使用 Actor handle、预先传入 token 的 AgentLoop API 或 start_turn_with_timeout。
+ModelRequest 是拥有所有权的值。Provider 收到它之后，可以把它交给 HTTP client、mock 脚本或别的实现，但不会拿到 AgentLoop 的可变引用。这样 provider 可以替换，主循环不用跟着变。
 
-`begin_turn` 接收新 TurnId 和文本，拒绝已有 active_turn，检查输入大小，保存输入，再调用 begin_queued_turn。后者要求 pending_inputs 非空，保存 TurnStarted，reset 进程内预算。输入不是 Turn 的一个直接字符串字段，而在 history 和 durable 队列里。
+## MockProvider 为什么重要
 
-正常 Text 经 ModelResponseRecorded/TurnCompleted 结束；Provider 或 Tool 普通错误通常记录 TurnFailed，SessionStatus 留 Failed，但 active_turn 清空。新的 UserInputRecorded 是明确的恢复入口：从 Failed 转回 Idle，然后可以开始新 Turn。这避免一次网络失败永久毒化会话。
+打开 src/model/mock.rs。MockProvider 通常包含两部分：
 
-Ask 时保存 ToolApprovalRequested，然后返回 `HarnessError::ApprovalPending`；active_turn 保留。调用者应根据错误类型选择审批，不可把所有 Err 视为终态。`approve_tool` 校验当前 Turn 和 call 的 Pending approval，保存人类决策，批准后执行同一个工具并继续同一 Turn；拒绝则保存 TurnCancelled。
+~~~text
+script
+  └─ 按顺序取出的 MockResponse
 
-直接 `cancel_turn` 只能在没有 start future 持有 Session 借用时使用，例如审批已暂停。它保存 cancel_requested/cancelled，不负责向另一个进程发送 OS 信号。Actor 的 CancelTurn 路径会触发 live token，见第 10/11 章。
+requests
+  └─ 保存每次收到的 ModelRequest，供测试检查
+~~~
 
-`Session::resume` 调 restore，只重建状态，既不调用 Provider，也不自动运行未完成 Turn。restore 最后比较 last_seq，确保重放期间 store 未发生无法接受的变化。from_state reset steps、tool_time_used 和开始时间；实时预算没有持久化。
+例如 demo 的 read 脚本是：
 
-## 6. 完整运行示例
+~~~text
+1. ToolCall(name = read, input = {"path":"README.md"})
+2. Text("read complete")
+~~~
 
-```bash
-cargo test --test checkpoint
-cargo test --test session_cancel
-cargo test approval_executes_the_pending_tool_and_keeps_the_turn_budget
-```
+它模拟模型先请求工具，再看到工具结果后给出最终文本。脚本耗尽时返回结构化 provider 错误，不应该 panic。
 
-观察：失败后同一个 Session 可运行下一轮；Actor 只取消当前 Turn；审批后原 TurnId 保持不变。`start_turn` 返回 `(TurnId, text)`，而 `SessionHandle::start_turn` 返回接收后的 TurnId，最终结果通过 wait_turn 获取。
+requests 让我们能观察上下文是否正确：
 
-## 7. 为什么这么设计
+~~~text
+第 1 次 request.history
+  └─ 用户输入
 
-直接 facade 容易嵌入和测试，没有 channel 成本；它把串行访问要求交给 Rust 借用检查。Actor 增加命令与回复通道，让取消、等待、审批进入执行中的会话。代价是“命令接收”和“状态可以修改”之间需要显式安排。
+工具完成之后的第 2 次 request.history
+  ├─ 用户输入
+  └─ HistoryItem::Tool { result: ... }
+~~~
 
-没有把所有历史 TurnState 永久保存在内存，是为了避免重复保存日志已有事实；但状态查看者应知道只保留当前 Turn。SessionStatus 和 run_state 也不同：后者是调度投影，Failed 且无 active_turn 时可投影为 Idle。
+如果第二次请求没有工具结果，runtime 的闭环就没有完成。
 
-## 8. 常见误解
+## 直接使用 Session 的路径
 
-- `ApprovalPending` 是暂停控制状态，不是已经执行失败。
-- `resume` 不等于从崩溃指令下一行继续跑。
-- `shutdown` 没有把整个会话事件历史删除，也没有新增 SessionClosed 事实。
+打开 src/runtime/session.rs 中的 Session 和构造函数。直接使用 Session 的调用大致是：
 
-## 9. 本章总结
+~~~text
+Session::new_with_policy(...)
+  └─ 内部创建 AgentLoop
 
-Session 提供会话边界；Loop 提供执行算法；reducer 定义状态迁移。开始、失败、审批和取消的返回值要与 active_turn 和日志一起理解。
+Session::start_turn(input)
+  └─ AgentLoop::run_turn(input)
+      └─ 返回 (TurnId, final_text)
+~~~
 
-## 10. 自测问题
+这种方式简单，适合单线程式的库调用。它的限制也很明确：start_turn 正在运行时，调用方没有另一个命令入口可以发送 cancel。
 
-1. 两条用户输入通常对应几个 Turn？参考：两个，属于同一 Session。
-2. Failed 后如何开始下一轮？参考：新输入事件恢复 Idle，再 TurnStarted。
-3. 为什么不能在直接 Session.start_turn 进行中调用 cancel_turn？参考：future 持有独占可变借用。
-4. resume 是否会消耗 Mock 脚本？参考：不会，restore 只重放。
+这就是为什么 CLI 中的简单 run 可以使用 Session，而 TUI、JSONL server 和跨进程操作通常使用 actor handle。
 
-## 11. 下一章如何衔接
+## actor 的路径
 
-现在深入[AgentLoop 的完整实现](05-agent-loop.md)，逐分支解释一次 Turn 如何运行。
+SessionHandle 背后是一个 tokio task。调用方不直接碰 AgentLoop，而是发 SessionCommand：
 
----
+~~~text
+调用方
+  │
+  ├─ mpsc::Sender<SessionCommand>
+  │
+  ▼
+session_actor::run_actor
+  │
+  ├─ 唯一持有 AgentLoop
+  ├─ 唯一追加事件
+  └─ oneshot::Sender 返回本次命令的结果
+~~~
 
-导航：上一章 [第 3 章：核心数据结构与身份](01-ids-and-events.md) · [首页](README.md) · 下一章 [第 5 章：AgentLoop 的完整实现](05-agent-loop.md)
+当前 SessionCommand 包含 StartTurn、CancelTurn、ApproveTool、WaitTurn、Checkpoint、QueryState 和 Shutdown。
+
+mpsc 传命令，oneshot 回结果。mpsc 适合连续接收请求，oneshot 适合“一条命令对应一个回复”。
+
+## 一个文本 turn 怎样走完
+
+对于 MockProvider 返回 Text 的情况，主路径可以简化成：
+
+~~~text
+Session::start_turn
+  → begin_turn
+      → user.input.recorded
+      → turn.started
+  → ContextSnapshot::from_state
+  → ModelProvider::complete
+  → provider.continuation.updated（有变化时）
+  → model.response.recorded
+  → turn.completed
+  → 返回文本
+~~~
+
+错误路径同样要记录事实。例如 provider 失败时，不能只把 Err 返回给调用方；runtime 还要追加 turn.failed。否则日志会停在 Running，恢复系统无法知道这是一个已经结束的失败 turn，还是进程在执行中崩溃。
+
+## actor 为什么不是 Arc<Mutex<Session>>
+
+共享一个 Mutex 也能让代码运行，但它会把几个问题混在一起：
+
+- 谁可以在 await 期间持有锁；
+- 状态迁移和事件追加是否同时发生；
+- cancel 和 start 谁先修改状态；
+- 一个命令失败后，锁内状态是否已经改变。
+
+actor 的规则更直接：只有 actor 能修改 AgentLoop，其他组件只能发命令。逻辑上的原子性由命令顺序和 append 事务保证。
+
+当前 actor 在活跃 turn 期间会 select 命令通道：
+
+- CancelTurn 会触发 turn token；
+- WaitTurn 会保存 waiter；
+- StartTurn 会暂存，等 AgentLoop future 释放可变借用后再 durable 地排队；
+- Checkpoint 会延迟到安全点；
+- Shutdown 会取消并等待清理。
+
+“收到命令”和“马上修改 state”不是同一个时刻。这个区别是读 session_actor.rs 时最容易漏掉的地方。
+
+## 读测试的方式
+
+运行：
+
+~~~bash
+cargo test mock_script_exhaustion_is_a_provider_error
+cargo test provider_error_records_turn_failed
+cargo test wait_turn_observes_provider_failure_after_start_ack
+cargo test session_actor
+~~~
+
+读 actor 测试时，画两条时间线：
+
+~~~text
+StartTurn 的 ack 什么时候返回
+WaitTurn 的结果什么时候返回
+~~~
+
+这两个时间点不一定相同。StartTurn 说明请求已经被接受，WaitTurn 说明 turn 已经有最终结果。
+
+## 这一章读完后
+
+你应该能解释：
+
+- MockProvider 为什么不只是测试替身；
+- ModelRequest 为什么必须是拥有所有权的快照；
+- Session 和 SessionHandle 的使用场景差异；
+- actor 如何保证只有一个写者；
+- provider 错误为什么也要留下 turn.failed。
+
+## 思考题
+
+1. 如果 Provider trait 接收的是 &mut SessionState，会出现哪两种边界混乱？
+2. 为什么 StartTurn 和 WaitTurn 要分开？把它们合成一个阻塞调用会让哪个客户端难以实现？
+3. actor 在执行模型请求时仍然需要接收 CancelTurn。取消信号经过哪些对象到达 provider？
+4. 如果 MockProvider 的 script 耗尽后 panic，为什么会让恢复语义变差？
+5. 直接使用 Session 的测试很方便。你会在什么条件下把它改成 SessionHandle？
+
+下一章：[Tool、Policy 和 Executor——一次 read 怎样到达文件系统](04-first-tool.md)。
+

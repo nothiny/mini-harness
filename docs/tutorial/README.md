@@ -1,101 +1,181 @@
-# mini-harness：从零开始的源码精读教材
+# mini-harness 教程：从一次请求读懂 Agent Harness
 
-本教材基于当前仓库提交 `1720acefc11fe38cfb9b3bb3d649832ef951d4a8`，核验日期 2026-10-14。目标读者了解LLM/Tool Calling并有编程基础，但不需要提前认识本项目或熟练Rust异步。读完应能从CLI追踪完整请求，解释各层边界，并独立规划、实现和调试小型扩展。
+> **注意（架构简化）**: 本仓库 `main`/`feature/simplify` 分支已经过教学化简化
+> （见 `SIMPLIFICATION_GUIDE.md`）：删除了 checkpoint、session actor、
+> durable queue 与 scheduler，合并了工具事件。本教程部分章节描述的是
+> **简化前**的实现，对应源码请切到 `bak` 分支对照阅读；核心概念
+> （事件溯源、reducer、进程组、审批）在两个版本中完全一致。
 
-先按行为阅读，再追源码：模型只提出建议，Harness决定授权、执行、记账、取消和恢复。第一次使用固定Mock脚本，把模型质量和网络波动从工程机制中排除。
+这是一份**对照源码学习**的教程。目标不是让你背下几个术语，而是让你能打开这个仓库，沿着一次真实请求走完代码，并解释每一个边界为什么存在。
 
-## 推荐阅读顺序
+你不需要先了解 Agent、事件溯源或分布式系统。只要会一点 Rust，愿意边读边运行命令，就可以从第 0 章开始。
 
-第一次阅读按第0—20章顺序；不要先钻进所有事件字段。第0—2章建立地图与真实运行，第3—8章解释闭环各角色，第9—13章深入可靠性边界，第14—17章看进程外控制与验证，第18—20章复盘并掌握扩展。
+## 这不是重写一个 Harness
 
-| 章 | 阅读目标 |
-|---|---|
-| [第 0 章：mini-harness 到底是什么？](00-overview.md) | Harness解决什么及尚未实现什么 |
-| [第 1 章：项目整体架构](architecture.md) | 完整模块、依赖、控制流与数据流 |
-| [第 2 章：第一次完整运行](first-run.md) | 真实11事件read Demo |
-| [第 3 章：核心数据结构与身份](01-ids-and-events.md) | 身份、history、state与事件形状 |
-| [第 4 章：Session 与生命周期](03-mock-provider-and-session.md) | 开始/完成/失败/审批/恢复 |
-| [第 5 章：AgentLoop 的完整实现](05-agent-loop.md) | 逐分支主循环、预算、异步与记账 |
-| [第 6 章：Model Provider 与模型 API 适配](08-openai-provider.md) | Mock、Responses、CC、HTTP与native IDs |
-| [第 7 章：Tool 系统](04-first-tool.md) | read/edit/bash参数与结果 |
-| [第 8 章：Executor 系统与副作用边界](executor.md) | 文件能力、hash/锁/rename与路径边界 |
-| [第 9 章：Event Sourcing、EventStore 与 Reducer](02-event-store-and-reducer.md) | 逐事件演算、JSONL存储、replay |
-| [第 10 章：Session Actor 与并发](session-actor.md) | 单写者、future借用、输入ack与队列 |
-| [第 11 章：进程管理、输出与取消](06-process-cancellation.md) | 组、双流、KILL、timeout与取消 |
-| [第 12 章：崩溃恢复、Checkpoint 与未知副作用](07-recovery.md) | 故障窗口、Unknown、恢复与快照验证 |
-| [第 13 章：Policy、审批与安全边界](policy.md) | Allow/Ask/Deny与授权/隔离区别 |
-| [第 14 章：CLI 与 JSONL 控制协议](09-cli-and-protocol.md) | 装配、版本、真实JSONL客户端 |
-| [第 15 章：Rust TUI、Ink UI 与显示状态](10-ui.md) | Rust行/全屏与Ink消息/审批路径 |
-| [第 16 章：Scheduler、队列与资源限制](11-scheduler.md) | Scheduler门面、FIFO与共享资源 |
-| [第 17 章：配置、测试与 Benchmark](config-tests-benchmarks.md) | 默认/覆盖、测试证据与Benchmark边界 |
-| [第 18 章：三个完整源码调用链复盘](call-chain-cases.md) | read、edit批准、bash取消/崩溃复盘 |
-| [第 19 章：架构设计决策与取舍](design-decisions.md) | 背景、收益、成本与替代方案 |
-| [第 20 章：如何扩展 mini-harness](12-next-steps.md) | 五类扩展的修改点、步骤与测试 |
+你要学习的是当前仓库里的这份实现。教程不会要求你新建项目、复制一套代码，或在每章末尾得到一个“自己的 mini-harness”。
 
+每章都采用同一个方法：
 
-如果已经看过项目，按问题复读：
+1. 先从一个用户动作或一次故障开始；
+2. 找到当前代码处理它的入口；
+3. 顺着数据、事件和状态往下读；
+4. 用现有测试或一个只读命令验证理解；
+5. 再解释为什么这个边界必须这样设计。
 
-- 调用链与模型闭环：2 → 5 → 6 → 7 → 8 → 18。
-- 日志、并发与崩溃：3 → 9 → 10 → 11 → 12 → 18。
-- 审批、协议与UI：4 → 13 → 14 → 15 → 16。
-- 准备扩展：17 → 19 → 20，并回到相关模块的失败测试。
+教程中的“任务”统一指一次源码阅读、运行观察或测试验证。
 
-## 如何使用每一章
+## 先用一句话理解 Harness
 
-每章固定包含：本章问题、设计思想、架构位置、源码位置、按入口分析、可验证运行、设计取舍、常见误解、总结、3—5项自测及参考答案、下一章衔接。源码片段只用于定位；简化代码、wire示例与故障fixture均标明性质，不把它们当本次真实模型输出。
+模型只负责提出建议：回答用户，或者请求调用某个工具。
 
-文件名保留原教程URL，所以文件数字不再等于新章号；章标题、导航和SUMMARY才是阅读顺序。例如原 `02-event-store-and-reducer.md` 现在是第9章，而第一次运行是 `first-run.md`。正文没有创建另一套平行教材。
+Harness 负责把建议变成**受控的现实动作**：检查权限、执行文件或进程、记录发生过的事实、处理取消与崩溃，并把结果重新交给模型。
 
-## 第一个实验
-
-在仓库根目录：
-
-```bash
-cargo test --locked
-cargo run --locked -- demo read README.md --json
-```
-
-这是只读文件Demo，事件在内存，不建立磁盘会话日志。固定Mock先要求read，再返回`read complete`；默认`run "..."`的Mock只返回`mock response`，不会依据自然语言选择工具。编辑Demo必须按第7/18章放在临时workspace，不能拿仓库README做替换实验。
-
-最重要的主链是：
+可以把它想成一个有门卫、有账本、有急停按钮的工作台：
 
 ```text
-run_demo / run_cli_turn / protocol start_turn
- → Session::start_turn 或 SessionCommand::StartTurn
- → AgentLoop::begin_turn / begin_queued_turn
- → continue_turn_with_reason
- → ContextSnapshot → ModelRequest → sample_model → ModelProvider
- → ModelCompletion → continuation/model/request事件
- → Registry.lookup → ToolPolicy.decide
- → ToolStarted → Tool.execute → Executor
- → ToolCompleted → append → EventStore → reducer派生history
- → 下一次ModelRequest → 最终文本 → TurnCompleted
+用户输入
+   │
+   ▼
+Session / Turn ──▶ Provider（模型）──▶ Tool call（建议）
+   │                                      │
+   │                              Policy（能不能做）
+   │                                      │
+   │                              Executor（实际去做）
+   │                                      │
+   └──────────── Event log（发生过什么）◀─┘
 ```
 
-这是一条循环，append穿插在所有阶段，并非只在最终回答时保存日志。准确的时序和逐事件表见第2、5、9、18章。
+## 这份教程怎样和源码对应
 
-## 阅读中必须区分的边界
+教程中的“第 3 章”等于当前仓库中的一个主题，不代表源码提交历史中的一天。每章都会明确列出：
 
-| 两侧 | 区别 |
-|---|---|
-| Model / Harness | 建议与受控执行 |
-| Session / Turn | 长期会话与单次工作 |
-| Session / AgentLoop | 调用/生命周期门面与执行算法 |
-| Provider / Executor | 网络模型协议与现实系统能力 |
-| Tool / Executor | 模型参数语义与文件/进程机制 |
-| Event / State | 历史事实与推导视图 |
-| EventStore / Checkpoint | 权威日志与可丢弃快照 |
-| Actor / async task | 状态单写者与并发等待/工作任务 |
-| Cancel / Timeout | 外部控制信号与预算触发，具体终态可能不同 |
-| Policy / Sandbox | 允许开始与OS物理隔离，当前无sandbox |
-| Execution Success / Task Correctness | 合法执行终态与独立验证任务满足要求 |
+1. 先读哪些真实文件；
+2. 一次调用从哪个函数进入、经过哪些函数；
+3. 运行哪条命令或测试观察结果；
+4. 哪些代码是核心，哪些是为生产边界补上的细节。
 
-## 证据、版本与限制
+### 源码地图
 
-所有源码链接指向上述固定提交，显示相对仓库路径；跨章链接是本地Markdown，适合仓库和mdBook。发生实现差异时以该提交源码及测试为准。原README、旧注释和教程的重要差异集中在[审查记录](source-audit.md)。
+| 你要理解的东西 | 当前源码 | 先看什么 |
+|---|---|---|
+| 公共模块和导出 | [src/lib.rs](https://github.com/nothiny/mini-harness/blob/master/src/lib.rs) | 项目有哪些边界 |
+| ID、历史、会话状态 | [src/runtime/ids.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/ids.rs)、[src/runtime/state.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/state.rs) | `SessionState`、`TurnState` |
+| 事件模型 | [src/durable/event.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/event.rs) | `EventPayload`、`Event` |
+| reducer | [src/durable/reducer.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/reducer.rs) | `reduce` 如何拒绝非法序列 |
+| 事件存储 | [src/durable/store.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/store.rs)、[src/durable/event_log.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/event_log.rs) | trait 与 JSONL 实现 |
+| 模型抽象 | [src/model/provider.rs](https://github.com/nothiny/mini-harness/blob/master/src/model/provider.rs) | `ModelRequest`、`ModelResponse`、`ModelProvider` |
+| 主循环 | [src/runtime/agent_loop.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop.rs) | `append`、`run_turn_with_cancel` |
+| 恢复和构造 | [src/runtime/agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop_setup.rs) | `restore`、`restore_with_checkpoint` |
+| actor | [src/runtime/session.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/session.rs)、[src/runtime/session_actor.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/session_actor.rs) | 命令如何串行化 |
+| 工具 | [src/tools/](https://github.com/nothiny/mini-harness/tree/master/src/tools/) | `Tool`、`ToolRegistry`、read/edit/bash |
+| 执行器 | [src/executor/](https://github.com/nothiny/mini-harness/tree/master/src/executor/) | 文件和进程的真实副作用 |
+| 协议 | [src/protocol/jsonl.rs](https://github.com/nothiny/mini-harness/blob/master/src/protocol/jsonl.rs) | 请求循环、事件通知、安全投影 |
+| UI | [src/ui/](https://github.com/nothiny/mini-harness/tree/master/src/ui/) | UI 如何只消费协议 |
+| CLI 组装 | [src/main.rs](https://github.com/nothiny/mini-harness/blob/master/src/main.rs) | 各个模块怎样接起来 |
 
-本次189个Rust测试通过，两个离线Demo、JSONL往返及编辑审批fixture已实测，文档引用/导航、图语法和mdBook构建的详情见[验证记录](validation.md)。真实模型API、外部业务Benchmark、Linux/Windows平台运行和真人交互终端不在本次实测范围。
+## 十分钟预览：先看一条真实链路
 
-Mermaid代码块可在支持Mermaid的Markdown阅读器渲染；当前mdBook配置没有Mermaid渲染插件，因此HTML构建保留图的代码文本。本次校验图语法与源调用关系，不声称mdBook自动绘图。源码和教程仍可完整阅读。
+先不要从类型定义开始。先让程序跑一次离线演示：
 
-[术语与Rust阅读提示](glossary.md)解释Arc/Mutex/await/select/channel等首次阅读障碍；[完整目录树](architecture.md)帮助定位；[验证记录](validation.md)说明命令证明的范围。
+```bash
+cargo run -- demo read README.md
+```
+
+这个命令使用 `src/main.rs::run_demo` 组装组件：
+
+- `MockProvider` 按脚本返回一个 `read` 调用，再返回文本 `read complete`；
+- `ToolRegistry` 注册 `ReadTool`、`EditTool`、`BashTool`；
+- `LocalExecutor` 把工作区设为当前目录；
+- `InMemoryEventStore` 保存事件，所以不会改动磁盘上的会话日志；
+- `Session::start_turn` 启动一次 turn。
+
+把输出看成一条时间线，大致会得到：
+
+```text
+session.created
+user.input.recorded
+turn.started
+provider.continuation.updated
+model.response.recorded        # 模型先提出 read
+tool.requested
+tool.started
+tool.completed                  # 文件内容回到历史
+provider.continuation.updated
+model.response.recorded        # 模型最后说 read complete
+turn.completed
+```
+
+这几行已经包含了全项目的核心思想：**模型的建议、工具的执行结果、最终回答，全部先成为事件，状态再从事件中推导出来。**
+
+想看完整 JSON，可以运行：
+
+```bash
+cargo run -- demo read README.md --json
+```
+
+第一次看到很长的工具输出是正常的。先只关注每个对象的 `seq`、`payload.type` 和 `turn_id`；字段含义会在第 1、2 章逐个解释。
+
+## 你会学到什么
+
+| 章节 | 主题 | 读完后能回答的问题 |
+|---|---|---|
+| 第 0 章 | 先建立一张地图 | 模型、工具、权限和持久化分别是谁负责？ |
+| 第 1 章 | 先读懂类型和事件 | 为什么不同 ID 不能都用 `String`？ |
+| 第 2 章 | EventStore 和 reducer——日志怎样变成状态 | 重启后状态怎样从日志恢复？ |
+| 第 3 章 | MockProvider、Session 和 actor | 怎样不联网先验证主循环？ |
+| 第 4 章 | Tool、Policy 和 Executor——一次 read 怎样到达文件系统 | 参数检查、权限检查和真实读文件为什么分层？ |
+| 第 5 章 | AgentLoop——一轮 turn 怎样反复采样 | 工具结果怎样回到下一次模型请求？ |
+| 第 6 章 | 进程、取消和原子编辑 | 怎样避免进程泄漏、管道死锁和半个文件？ |
+| 第 7 章 | 崩溃恢复——系统怎样面对“不知道” | 为什么“失败”和“结果未知”不能混为一谈？ |
+| 第 8 章 | 真实 provider——Responses 与 Chat Completions | provider 换了，主循环为什么不用改？ |
+| 第 9 章 | CLI 和 JSONL 协议——把 runtime 放到进程边界外 | 为什么 stdout 只能输出协议？ |
+| 第 10 章 | 事件查看器和 Ink TUI——UI 只是事件投影 | UI 崩溃时，runtime 怎样继续工作？ |
+| 第 11 章 | Scheduler、durable 队列和全局并发 | 输入队列怎样做到可恢复？并发上限放在哪里？ |
+| 尾声 | 把这份 Harness 读成一个系统 | 怎样继续做 sandbox、PTY、MCP 或远程执行器？ |
+
+术语不确定时，查[术语表](glossary.md)。
+
+## 每章的阅读顺序
+
+不要一开始就试图理解整章所有细节。每章按下面顺序读：
+
+1. **先看本章问题**：知道这一章要解释哪个运行时行为；
+2. **再看源码对照**：打开列出的文件，先找结构体和入口函数；
+3. **运行观察命令**：把抽象概念变成输出或事件；
+4. **逐步读主路径**：只追一条成功路径；
+5. **最后读失败路径和测试**：理解边界是怎样被锁住的；
+6. **再做思考题**：用自己的话解释“如果删掉这条检查会发生什么”。
+
+每章的代码片段用于帮助你定位源码和理解关键步骤，不是另一份独立实现。源码中已经存在的实现才是最终事实；如果教程文字和源码不一致，以源码和对应测试为准，并把差异记下来。
+
+文中的代码片段用于定位源码和解释关键步骤。先不要复制代码；只有当你想检验自己是否真的掌握时，才把某个函数改成小实验，再用测试恢复。
+
+## 环境和常用命令
+
+要求：Rust 1.85+，2024 edition。
+
+```bash
+rustc --version
+cargo test
+cargo test --test integration_agent_loop
+cargo test --test recovery_classify
+RUST_LOG=mini_harness=debug cargo run -- demo read README.md
+```
+
+`cargo test` 是离线的。只有第 8 章的真实 provider 部分需要 API key；教程会先用 mock HTTP server 讲清楚协议，因此不必一开始准备密钥。
+
+## 学习中的三个约定
+
+### 1. 看到 `Event`，先问它记录的是事实还是状态
+
+`tool.completed` 是事实；“当前有没有正在运行的工具”是 reducer 推导出来的状态。这个区分会贯穿恢复、协议和 UI。
+
+### 2. 看到 `Arc`，先问谁拥有写权限
+
+共享读取很常见；会话状态和事件追加只有 actor 能改。后面看到 `SessionCommand`，把它理解为“请求唯一写者替我做一次状态迁移”。
+
+### 3. 看到 `Result`，先问错误由谁处理
+
+工具参数错误可以回给模型；策略拒绝要显示给用户；事件日志损坏通常要停止恢复。错误类型的边界就是模块边界的说明书。
+
+准备好后，从[第 0 章：先建立一张地图](00-overview.md)开始。

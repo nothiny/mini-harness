@@ -1,174 +1,213 @@
 # mini-harness
 
-从零实现的 agent harness 运行时：**可取消、可崩溃恢复、可接真实模型**。
+**从零实现的 Agent Harness 学习项目**
 
-harness 是模型循环之外的全部系统——工具执行与授权、进程管理、事件日志、崩溃恢复、协议与 UI。本项目把这些边界逐阶段砌了出来，并用一组无网络依赖的测试钉住核心语义。
+理解 Agent Harness 的核心概念：事件溯源、工具执行、崩溃恢复。
 
-## 特性
+harness 是模型循环之外的全部系统——工具执行与授权、进程管理、事件日志、崩溃恢复。本项目以 ~10k 行 Rust 把这些边界砌了出来（协议服务器与 benchmark 另有独立 crate），并用一组 160+ 无网络依赖的测试钉住核心语义。
 
-- **事件溯源内核**：JSONL 事件日志是唯一事实，确定性 reducer 从事实重建全部状态；重放两次必然同态
-- **单写者 session actor**：状态迁移与事件追加由唯一写者完成，先验证、再持久化、后提交
-- **真实的进程执行**：进程组级取消（连子孙进程一起清理）、stdout/stderr 并发排空、三层输出上限、UTF-8 安全截断
-- **崩溃恢复语义**：区分"确定失败"与 `OutcomeUnknown`（可能已产生副作用）；原子 checkpoint，损坏时回退全量重放
-- **durable 输入队列**：turn 运行期间的输入作为事实排队，按 FIFO 自动执行，队列上限拒绝先于持久化
-- **全局进程并发上限**：executor 层共享信号量，超限返回结构化错误而非无限排队
-- **provider 可替换**：确定性 MockProvider 与 OpenAI Responses / Chat Completions 通过同一套行为契约测试
-- **JSONL 控制协议**：stdout 只归协议；v2 事件通知是安全投影，工具原始输入/输出不出协议层
-- **TOML 配置**：五个 section，未知字段按行号拒绝，分层 CLI > 文件 > 默认值
+## 5 分钟快速理解
 
-## 架构
+### 核心概念
 
-```text
-CLI / Ink UI ──(JSONL over stdio)──▶ Session actor（单写者）
-                                       │
-                 ┌─────────────────────┼──────────────────┐
-            Provider              Agent loop          Policy
-          mock / OpenAI        （事务性 append）    allow/ask/deny
-                 └─────────────────────┼──────────────────┘
-                                       │
-                                  Executor
-                  workspace 边界 · 进程组 · 输出上限 · 并发信号量
-                                       │
-                        Event log（事实）+ Checkpoint（快照）
+1. **事件溯源**: 所有状态变化都记录为事件，状态 = reduce(事件列表)
+2. **Agent Loop**: 模型采样 → 工具调用 → 返回结果 → 下一轮
+3. **工具执行**: 安全地执行子进程，限制输出，支持取消
+4. **崩溃恢复**: 从事件日志重放，恢复到崩溃前的状态
+5. **审批流程**: 危险工具需要用户确认才能执行
+
+### 代码结构
+
+```
+src/
+├── durable/      事件溯源（event.rs, reducer.rs, event_log.rs）
+├── runtime/      Agent 循环（agent_loop.rs, session.rs）
+├── executor/     进程执行（local.rs, process.rs）
+├── model/        模型接口（provider.rs, mock.rs, openai.rs）
+├── policy/       工具审批（allow / ask）
+└── tools/        工具注册（read.rs, edit.rs, bash.rs）
+
+mini-harness-server/     JSONL 协议服务器（可选，供 TUI/自定义客户端）
+mini-harness-benchmark/  Benchmark 运行器（可选）
+ui/                      Ink TUI（TypeScript，经协议服务器驱动）
 ```
 
 ## 快速开始
 
-要求：Rust 1.85+（2024 edition）。
+### 安装
 
 ```bash
 git clone https://github.com/nothiny/mini-harness.git
 cd mini-harness
-cargo test                        # 全部离线
-cargo run -- demo read README.md  # 离线观察一次完整工具调用链
-cargo run -- run "hello"          # 持久化会话（默认 mock provider）
+cargo test --workspace  # 全部测试离线运行
 ```
 
-### CLI 一览
+### 离线演示
 
-| 命令 | 说明 |
-|---|---|
-| `run` / `resume` / `cancel` | 持久化会话；省略 `--event-log` 时使用 `~/.mini-harness/sessions/<id>/` 目录布局 |
-| `serve --stdio` | JSONL 协议服务器（`session.create`、`turn.start/wait/cancel`、`approval.respond`…） |
-| `tui` / `events` | 交互式 UI / 一次性事件查看器，只消费安全事件投影 |
-| `benchmark` | 按 TOML/JSON 清单执行非交互任务并保存事件、checkpoint 与机器可读结果 |
-| `inspect` / `recover` / `abandon-turn` / `sessions` | 恢复工具：分类未完成工作、标记未知结果、显式放弃 |
-| `init` / `config` / `doctor` | 写默认配置 / 打印生效配置 / 环境体检 |
-| `demo read` / `demo edit-bash` | 内存事件日志的离线演示，不联系真实 provider |
+```bash
+# 观察一次完整的工具调用链（不需要 API key）
+cargo run -- demo read README.md
 
-### 接入 DeepSeek
+# 查看生成的事件流（每行一个事实）
+cargo run -- demo read README.md --json
+```
+
+### 接入真实模型
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
-cargo run -- run "总结一下这个项目" --provider deepseek --workspace .
+cargo run -- run "总结这个项目" --provider deepseek --workspace .
 ```
 
-或在配置文件里固定（对 `run`/`resume`/`tui`/`events`/`serve` 全部生效）：
-
-```toml
-[model]
-provider = "deepseek"
-name = "deepseek-flash"
-```
-
-`run` 是非交互命令。默认策略下 `edit_workspace` 和 `bash` 都是 `ask`，一旦模型要写文件或执行命令，`run` 会以 `approval pending` 结束而不会执行工具。无人值守场景在配置里放宽：
-
-```toml
-[permissions]
-read_workspace = "allow"
-edit_workspace = "allow"
-bash = "allow"   # 模型可不经确认执行任意命令，仅限受控环境
-```
-
-说明：
-
-- DeepSeek 走 OpenAI 兼容的 **Chat Completions** 协议；与 OpenAI Responses 是两种 wire 格式，本项目按 provider 自动选择
-- `deepseek-flash` 支持函数调用（read/edit/bash 工具链可用）
-- `serve --stdio` 的 session 参数同样接受 `provider: "deepseek"`；`doctor` 会检查 `DEEPSEEK_API_KEY`
-- 其他 Chat Completions 兼容服务（Kimi、Qwen、vLLM、Ollama……）可通过 `OpenAiProviderConfig::with_endpoint(...).with_wire_style(WireStyle::ChatCompletions)` 接入
-
-### Benchmark
-
-`benchmark` 用一个固定清单顺序执行多个独立 workspace。它会在每次运行的唯一 artifact 目录保存原始 JSONL 事件、checkpoint、清单和脱敏后的有效配置，并持续写入 `results.json`。结果中的 `execution_status` 描述 harness 是否正常完成；`task_result` 默认是 `not_verified`，必须由 Harbor 或其他独立 verifier 检查 workspace 后决定。
+## CLI 命令
 
 ```bash
-mkdir -p /tmp/mini-harness-benchmark-task
-cargo run --release -- benchmark benchmark/tasks.example.toml \
-  --provider deepseek --model deepseek-chat \
-  --artifacts ./benchmark-artifacts \
-  --results ./benchmark-results.json
+# 基础命令
+cargo run -- run "hello"                      # 新会话
+cargo run -- resume <session-id> "follow-up"  # 恢复会话
+cargo run -- cancel <session-id> <turn-id>    # 取消 turn
+
+# 查看命令
+cargo run -- events <session-id>              # 查看事件日志
+cargo run -- inspect <session-id>             # 重放并查看状态
+cargo run -- sessions                         # 列出所有会话
+
+# 工具命令
+cargo run -- config                           # 显示配置
+cargo run -- doctor                           # 环境检查
+cargo run -- demo read README.md              # 离线演示
 ```
 
-当前 benchmark runner 不安装 shell 的 OS 级 sandbox；真实评测应在 Harbor 的一次性 task 容器中运行。固定的 Terminal-Bench 2.1 开发子集、oracle 预检和 Harbor 适配器见 [`benchmark/harbor/README.md`](benchmark/harbor/README.md)。
+## 学习路径
 
-### 交互式 TUI
+### 第一步：理解事件溯源（2 小时）
 
-`ui/` 目录包含一个 [Ink](https://github.com/vadimdemedes/ink)（React for CLI）编写的 TUI，驱动同一个 `mini-harness serve --stdio` 后端：
+1. 阅读 `src/durable/event.rs` - 理解事件类型
+2. 阅读 `src/durable/reducer.rs` - 理解状态重建
+3. 运行 `cargo run --example 01_event_sourcing`
+4. 运行 `demo read README.md --json` 并对照 JSONL 日志
+5. 手动修改日志，重新 `inspect` 观察状态变化
+
+### 第二步：理解 Agent Loop（2 小时）
+
+1. 阅读 `src/runtime/agent_loop.rs` 的 `continue_turn` 函数
+2. 理解循环：sample → tool calls → results → next step
+3. 运行 `cargo run --example 02_agent_loop`
+4. 修改 `MockProvider` 实现自定义模型行为
+5. 添加自定义工具
+
+### 第三步：理解进程管理（2 小时）
+
+1. 阅读 `src/executor/process.rs` - 进程组、SIGKILL
+2. 阅读 `src/executor/local.rs` - 输出限制
+3. 运行 `cargo run --example 03_tool_execution`
+4. 实验：启动长时间任务并 cancel
+
+### 第四步：理解崩溃恢复（1 小时）
+
+1. 启动一个 turn，中途 `kill -9` 强制终止
+2. 使用 `resume` 恢复会话
+3. 观察事件重放过程
+4. 运行 `cargo run --example 04_crash_recovery`
+
+**总学习时间**: 7-8 小时
+
+## 进阶功能
+
+### 协议服务器（可选）
+
+如果需要构建自定义 UI（例如 Ink TUI）：
 
 ```bash
-cd ui && npm install
-
-make tui          # 接入 DeepSeek
-make tui-demo     # 不启动 Rust 后端，离线播放工具调用、审批和回答
-# 或直接运行：npx tsx src/main.tsx --provider deepseek --workspace .. \
-#             [--provider mock --workspace /tmp --event-log /tmp/tui.jsonl]
+cargo build -p mini-harness-server
+./target/debug/mini-harness-server --stdio
 ```
 
-UI 改动可以用 `cd ui && npm run typecheck && npm test` 做本地检查。`tui-demo` 使用固定的假 client，不会读取 API key，也不会修改 workspace。
+参见 `mini-harness-server/`。
 
-保留审批、由使用者决定是否执行时，工具触发审批在 TUI 里交互确认后才会执行。
+### Benchmark（可选）
 
-### 配置
-
-```toml
-[model]
-provider = "mock"          # 或 "openai" / "deepseek"
-name = "deepseek-flash"
-
-[session]
-max_steps = 20
-max_turn_time_ms = 600000
-max_batch_tool_calls = 16
-max_queued_inputs = 16
-
-[execution]
-max_output_bytes = 200000
-default_timeout_ms = 120000
-max_concurrent_processes = 8
-
-[durable]
-root = "~/.mini-harness"
-flush = "buffered"         # 或 "synced"
-checkpoint_every_events = 50
-
-[permissions]
-read_workspace = "allow"
-edit_workspace = "ask"
-bash = "ask"
-```
-
-时长类限制以零值表示"关闭"；计数类限制零值即立即拒绝。
-
-## 语义要点
-
-- **跨进程取消**：`cancel` 向事件日志写入终态事件；被取消进程在下一次追加前发现日志已变，以 durable 错误停止——宁可失败也不覆盖别人的写入
-- **可观测性**：诊断日志只写 stderr（stdout 由协议独占），默认 `warn`，`RUST_LOG=mini_harness=debug` 查看事件持久化、工具执行、进程与 provider 尝试
-- **审批流**：策略 `ask` 的工具调用持久化挂起，`approval.respond` 决定后续；策略拒绝记录独立的 `tool.policy_denied` 事件，与用户拒绝严格区分
-
-## 测试
+如果需要评测性能：
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo run -p mini-harness-benchmark -- tasks/tasks.example.toml --provider deepseek
 ```
 
-覆盖面：provider 行为契约（mock 与真实 provider 跑同一套六场景）、重放确定性 property 测试（种子化随机脚本）、跨进程追加/取消/修复探针、审批与队列的全相位边缘、进程组清理与输出上限回归。
+参见 `mini-harness-benchmark/`。
 
-## 状态与路线
+## 架构设计
 
-核心阶段（类型与事件 → 事件溯源 → mock provider → 工具与执行器 → agent loop → 进程与取消 → 恢复 → provider → CLI 与协议 → scheduler）已完成；下一个深度专题是 OS 级 sandbox（macOS Seatbelt / Linux Landlock，fail-closed）。
+### 为什么用事件溯源？
+
+传统做法：直接修改内存状态
+- ❌ 崩溃后无法恢复
+- ❌ 无法追溯历史决策
+- ❌ 难以调试
+
+事件溯源做法：所有变化都是事件
+- ✅ 崩溃后重放事件即可恢复
+- ✅ 完整的决策历史
+- ✅ 时间旅行调试
+
+### 为什么需要进程组？
+
+传统做法：直接 `kill(pid)`
+- ❌ 子进程会泄漏（例如 bash 启动的子进程）
+- ❌ 无法清理孙进程
+
+进程组做法：`kill(-pgid)`
+- ✅ 一次性清理整个进程树
+- ✅ 防止僵尸进程
+
+### 为什么需要工具审批？
+
+传统做法：模型直接执行
+- ❌ 模型可能执行危险命令（`rm -rf /`）
+- ❌ 用户无法干预
+
+审批做法：危险工具需确认
+- ✅ 用户可以拒绝危险操作
+- ✅ 审批决策记录在事件中
+
+## 与生产系统的差异
+
+mini-harness 是**学习项目**，与生产级 Harness 的差异：
+
+| 特性 | mini-harness | 生产级 (例如 Claude Code) |
+|------|--------------|---------------------------|
+| 代码量 | ~10k 行 | 50k+ 行 |
+| Checkpoint | ❌ 只有重放 | ✅ 增量快照 |
+| 并发模型 | 同步 Session | Actor/Channel 并发 |
+| OS 沙箱 | ❌ 只有路径检查 | ✅ Landlock/Seatbelt |
+| Context 管理 | 简单 sliding window | 智能压缩 + 摘要 |
+| 工具并行 | 串行执行 | 并行执行 |
+| Streaming | ❌ | ✅ |
+
+**学习建议**: 先理解 mini-harness 的核心概念，再研究生产系统的优化。
+
+## 常见问题
+
+### Q: 为什么事件这么多？
+
+每个工具调用记录 2 个事件（请求+完成），确保崩溃后可以恢复。
+请求事件同时携带审批标记（`requires_approval`），用户决定单独记录。
+
+### Q: 可以简化为不记录事件吗？
+
+不推荐。不记录事件意味着：
+- 崩溃后无法知道"工具是否已执行"
+- 可能导致重复执行（例如两次删除同一文件）
+- 违背 Event Sourcing 原则
+
+### Q: 为什么不支持工具并行？
+
+简化版串行执行，便于理解。生产级需要并行执行 + 依赖图管理。
+
+### Q: 如何添加自定义工具？
+
+实现 `tools/spec.rs` 中的 `Tool` trait 并注册到 `ToolRegistry`，
+参考 `src/tools/read.rs` 的结构。
 
 ## License
 
-[MIT](LICENSE)
+MIT
