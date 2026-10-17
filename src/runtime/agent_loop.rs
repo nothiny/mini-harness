@@ -192,16 +192,11 @@ where
             )));
         }
         let mut next_state = self.state.clone();
+        // 注意: 这里不再检查累积 history 是否超过 `max_context_bytes`。
+        // 那个限制属于滑动窗口后的模型请求（见 continue_turn）；累积
+        // 审计历史的上限由 reducer 的 `MAX_HISTORY_BYTES` 独立保护，
+        // 两者共用一个限制会误拒长会话（ARCHITECTURE_REVIEW P0-2）。
         reduce(&mut next_state, &event)?;
-        let history_size = serde_json::to_vec(&next_state.history)
-            .map_err(|error| HarnessError::InvariantViolation(error.to_string()))?
-            .len();
-        if history_size > self.config.max_context_bytes {
-            return Err(HarnessError::InvariantViolation(format!(
-                "session history exceeds the {} byte context limit",
-                self.config.max_context_bytes
-            )));
-        }
         let persisted = self.store.append(event).await?;
         tracing::debug!(
             target: "mini_harness::durable",

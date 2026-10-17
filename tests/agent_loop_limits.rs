@@ -144,3 +144,103 @@ async fn zero_duration_limits_disable_the_budgets() {
         Some(EventPayload::TurnCompleted { .. })
     ));
 }
+
+/// 累积 history 与滑动窗口后的请求使用不同的上限
+/// （ARCHITECTURE_REVIEW P0-2 的回归测试）。
+///
+/// durable history 超过 `max_context_bytes`（1MB）后，只要滑动窗口
+/// 裁剪出的请求仍小于限制，对话就必须能继续 —— 事件追加不得因为
+/// "审计历史太长"而失败。
+#[tokio::test]
+async fn large_durable_history_does_not_block_small_context_requests() {
+    let directory = tempdir().unwrap();
+    tokio::fs::write(directory.path().join("note.txt"), "hello")
+        .await
+        .unwrap();
+    let session = SessionId::new();
+
+    // 1. 构造 durable history 超过 1MB 的事实序列（80 轮 × 每轮 ~32KB）
+    let big = "x".repeat(16 * 1024);
+    let mut events = Vec::new();
+    let mut seq = 0u64;
+    let push = |turn: Option<mini_harness::runtime::TurnId>,
+                    payload: EventPayload,
+                    events: &mut Vec<mini_harness::durable::Event>,
+                    seq: &mut u64| {
+        *seq += 1;
+        let mut event = mini_harness::durable::Event::new(session, turn, payload);
+        event.seq = EventSeq(*seq);
+        events.push(event);
+    };
+    push(None, EventPayload::SessionCreated, &mut events, &mut seq);
+    for round in 0..80 {
+        let turn = mini_harness::runtime::TurnId::new();
+        push(
+            None,
+            EventPayload::UserInputRecorded {
+                input: mini_harness::runtime::UserInput(format!("{round}: {big}")),
+            },
+            &mut events,
+            &mut seq,
+        );
+        push(Some(turn), EventPayload::TurnStarted, &mut events, &mut seq);
+        for payload in [
+            EventPayload::ModelResponseRecorded {
+                text: mini_harness::runtime::ModelText(format!("done {round}: {big}")),
+            },
+            EventPayload::TurnCompleted {
+                text: mini_harness::runtime::ModelText(format!("done {round}: {big}")),
+            },
+        ] {
+            push(Some(turn), payload, &mut events, &mut seq);
+        }
+    }
+    let mut state = mini_harness::runtime::SessionState::new(session);
+    for event in &events {
+        mini_harness::durable::reduce(&mut state, event).unwrap();
+    }
+    assert!(
+        serde_json::to_vec(&state.history).unwrap().len() > 1024 * 1024,
+        "fixture must push durable history past max_context_bytes"
+    );
+    assert!(state.active_turn.is_none());
+    let last_seq = state.last_seq;
+
+    // 2. 用该状态继续对话: 请求经滑动窗口裁剪后远小于 1MB
+    let provider = Arc::new(MockProvider::new(vec![MockResponse::Text(
+        "still working".into(),
+    )]));
+    let store = Arc::new(InMemoryEventStore::default());
+    {
+        use mini_harness::durable::EventStore;
+        for event in &events {
+            store.append(event.clone()).await.unwrap();
+        }
+    }
+    let mut loop_ = AgentLoop::from_state(
+        provider,
+        Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
+        registry_with_read(),
+        store.clone(),
+        state,
+        Arc::new(mini_harness::policy::AllowAllPolicy),
+        mini_harness::runtime::agent_loop::AgentLoopConfig::default(),
+    );
+    assert_eq!(loop_.state.last_seq, last_seq);
+
+    let (_, text) = loop_
+        .run_turn("continue after a long history".into())
+        .await
+        .unwrap();
+    assert_eq!(text, "still working");
+
+    // 3. 模型请求确实被滑动窗口压到了限制以内
+    let requests = loop_.provider.requests();
+    let request_bytes = serde_json::to_vec(&requests[0]).unwrap().len();
+    assert!(
+        request_bytes
+            <= mini_harness::runtime::agent_loop::AgentLoopConfig::default().max_context_bytes,
+        "sliding window must bound the request: {request_bytes} bytes"
+    );
+    assert!(requests[0].history.len() < 322);
+}

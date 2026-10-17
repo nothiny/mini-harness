@@ -7,9 +7,16 @@ use crate::{
     },
 };
 /// Durable history is bounded independently of the provider-facing context.
-/// Keeping this below the event-log limit prevents one session snapshot from
-/// growing without bound while still retaining enough audit history.
-pub(crate) const MAX_HISTORY_BYTES: usize = 1024 * 1024;
+///
+/// 两层限制各司其职（见 ARCHITECTURE_REVIEW P0-2 的修复）:
+///
+/// * 这里（8MB）: 累积审计历史的上限，防止一个会话快照无限增长；
+/// * `AgentLoopConfig::max_context_bytes`（1MB）: 单次模型请求的上限，
+///   作用在滑动窗口裁剪之后。
+///
+/// 若两者共用同一个限制，长会话的累积 history 会先触顶，导致滑动
+/// 窗口后本还很小的请求被误拒。
+pub(crate) const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 fn push_history(state: &mut SessionState, item: HistoryItem) -> Result<(), HarnessError> {
     if state.history_bytes == 0 && !state.history.is_empty() {
