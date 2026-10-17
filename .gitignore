@@ -21,3 +21,6 @@ mini-harness-tui.checkpoint.json
 # Python benchmark adapter caches.
 __pycache__/
 *.py[cod]
+
+# Python bytecode (Harbor adapter)
+__pycache__/

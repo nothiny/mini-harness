@@ -1,9 +1,9 @@
 use mini_harness::{
-    durable::{Event, EventPayload, reduce},
+    durable::{Event, EventPayload, ToolOutcome, reduce},
     error::ToolError,
     runtime::{
-        EventSeq, ExecutionId, HistoryItem, ModelText, ProviderContinuation, SessionId,
-        SessionState, SessionStatus, ToolCallId, ToolName, TurnId, UserInput,
+        EventSeq, HistoryItem, ModelText, ProviderContinuation, SessionId, SessionState,
+        SessionStatus, ToolCallId, ToolName, TurnId, UserInput,
     },
 };
 
@@ -94,24 +94,20 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
                 call_id: call,
                 name: ToolName("read".into()),
                 input: serde_json::json!({"path": "missing.txt"}),
+                requires_approval: false,
             },
         ),
+        // 执行后的失败（副作用可能已发生）阻塞 turn 完成。
         event(
             session,
             Some(turn),
             6,
-            EventPayload::ToolStarted {
+            EventPayload::ToolCompleted {
                 call_id: call,
-                execution_id: ExecutionId::new(),
-            },
-        ),
-        event(
-            session,
-            Some(turn),
-            7,
-            EventPayload::ToolFailed {
-                call_id: call,
-                error: ToolError::from("file missing"),
+                outcome: ToolOutcome::Failed {
+                    error: ToolError::from("file missing"),
+                },
+                duration_ms: 5,
             },
         ),
     ];
@@ -122,7 +118,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
     let invalid = event(
         session,
         Some(turn),
-        8,
+        7,
         EventPayload::TurnCompleted {
             text: ModelText("done".into()),
         },
@@ -133,7 +129,7 @@ fn failed_tool_cannot_be_followed_by_turn_completed() {
     let failed = event(
         session,
         Some(turn),
-        8,
+        7,
         EventPayload::TurnFailed {
             error: "tool failed".into(),
         },

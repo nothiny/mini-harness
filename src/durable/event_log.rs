@@ -671,13 +671,12 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn reads_mixed_schema_log_and_migrates_it_atomically() {
+    async fn reads_a_current_schema_log_and_rejects_legacy_lines() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         let session = SessionId::new();
         let mut first = Event::new(session, None, EventPayload::SessionCreated);
         first.seq = EventSeq(1);
-        first.schema_version = 1;
         let mut second = Event::new(
             session,
             None,
@@ -700,18 +699,26 @@ mod tests {
         let store = JsonlEventStore::new(path.clone());
         let events = store.read_from(EventSeq(1)).await.unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].schema_version, 1);
+        assert_eq!(events[0].schema_version, Event::CURRENT_SCHEMA_VERSION);
         assert_eq!(events[1].schema_version, Event::CURRENT_SCHEMA_VERSION);
-        assert!(store.migrate_to_current_schema().await.unwrap());
-        assert!(!store.migrate_to_current_schema().await.unwrap());
-        let migrated = store.read_from(EventSeq(1)).await.unwrap();
-        assert!(
-            migrated
-                .iter()
-                .all(|event| event.schema_version == Event::CURRENT_SCHEMA_VERSION)
-        );
-        let raw = tokio::fs::read_to_string(path).await.unwrap();
-        assert!(!raw.contains("\"schema_version\":1"));
+
+        // 简化版（schema 3）更换了事件形状：旧版本日志直接拒绝重放。
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "event_id": "evt_00000000-0000-0000-0000-000000000000",
+            "seq": 3,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "session_id": session.to_string(),
+            "turn_id": null,
+            "payload": {"type": "session_created", "data": null},
+        });
+        let mut raw = tokio::fs::read_to_string(&path).await.unwrap();
+        raw.push_str(&format!("{legacy}\n"));
+        tokio::fs::write(&path, raw).await.unwrap();
+        assert!(matches!(
+            JsonlEventStore::new(path).last_seq().await,
+            Err(crate::error::DurableError::UnsupportedSchema(2))
+        ));
     }
 }
 
@@ -720,12 +727,19 @@ mod incremental_tests {
     use super::*;
     use crate::durable::{EventPayload, EventStore};
 
-    fn input_event(session: SessionId, text: &str) -> Event {
+    fn attempt_event(session: SessionId, turn: crate::runtime::TurnId, text: &str) -> Event {
         Event::new(
             session,
-            None,
-            EventPayload::UserInputRecorded {
-                input: crate::runtime::UserInput(text.into()),
+            Some(turn),
+            EventPayload::ProviderAttemptRecorded {
+                attempt: 1,
+                client_request_id: text.into(),
+                request_id: None,
+                response_id: None,
+                outcome: "ok".into(),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
             },
         )
     }
@@ -735,15 +749,30 @@ mod incremental_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shared.jsonl");
         let session = SessionId::new();
+        let turn = crate::runtime::TurnId::new();
         // "Process A" creates the log and caches a validated prefix.
         let store_a = JsonlEventStore::new(path.clone());
         store_a
             .append(Event::new(session, None, EventPayload::SessionCreated))
             .await
             .unwrap();
+        store_a
+            .append(Event::new(
+                session,
+                None,
+                EventPayload::UserInputRecorded {
+                    input: crate::runtime::UserInput("warm".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        store_a
+            .append(Event::new(session, Some(turn), EventPayload::TurnStarted))
+            .await
+            .unwrap();
         for index in 0..50 {
             store_a
-                .append(input_event(session, &format!("warm {index}")))
+                .append(attempt_event(session, turn, &format!("warm {index}")))
                 .await
                 .unwrap();
         }
@@ -756,16 +785,16 @@ mod incremental_tests {
         let store_b = JsonlEventStore::new(path.clone());
         for index in 0..10 {
             store_b
-                .append(input_event(session, &format!("b {index}")))
+                .append(attempt_event(session, turn, &format!("b {index}")))
                 .await
                 .unwrap();
         }
         let events = store_a.read_from(EventSeq(1)).await.unwrap();
-        assert_eq!(events.len(), 61);
+        assert_eq!(events.len(), 63);
         assert!(matches!(
             &events.last().unwrap().payload,
-            EventPayload::UserInputRecorded { input }
-                if input.0 == "b 9"
+            EventPayload::ProviderAttemptRecorded { client_request_id, .. }
+                if client_request_id == "b 9"
         ));
         assert_eq!(store_a.suffix_validations(), 1);
         assert_eq!(store_a.full_replays(), full_replays_before);

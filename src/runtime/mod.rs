@@ -5,7 +5,6 @@ pub mod context;
 pub mod ids;
 mod sampling;
 pub mod session;
-mod session_actor;
 pub mod state;
 pub mod types;
 pub use context::*;

@@ -84,16 +84,18 @@ function thisDir(): string {
   return dirname(fileURLToPath(import.meta.url));
 }
 
-/** Finds the mini-harness binary relative to this project. */
+/** Finds the mini-harness-server binary relative to this project. */
 export function findBinary(explicit?: string): string {
   if (explicit) return explicit;
   // ui/src/client.ts → ui/ → repo root → target/{debug,release}
   const repoRoot = join(thisDir(), "..", "..");
   for (const profile of ["debug", "release"]) {
-    const candidate = join(repoRoot, "target", profile, "mini-harness");
-    if (existsSync(candidate)) return candidate;
+    for (const name of ["mini-harness-server", "mini-harness"]) {
+      const candidate = join(repoRoot, "target", profile, name);
+      if (existsSync(candidate)) return candidate;
+    }
   }
-  return "mini-harness"; // hope it's on PATH
+  return "mini-harness-server"; // hope it's on PATH
 }
 
 export class HarnessClient {
@@ -106,7 +108,7 @@ export class HarnessClient {
   private emitter = new EventEmitter();
 
   constructor(binaryPath: string) {
-    this.proc = spawn(binaryPath, ["serve", "--stdio"], {
+    this.proc = spawn(binaryPath, ["--stdio"], {
       stdio: ["pipe", "pipe", "inherit"], // stderr goes to our stderr
     });
 

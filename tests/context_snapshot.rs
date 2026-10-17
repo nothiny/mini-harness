@@ -3,7 +3,7 @@ use mini_harness::{
     executor::LocalExecutor,
     model::{MockProvider, MockResponse, ModelRequest, ToolCall},
     runtime::agent_loop::AgentLoop,
-    runtime::session::{Session, spawn_with_system_instructions},
+    runtime::session::Session,
     runtime::{
         ContextSnapshot, HistoryItem, ModelText, SessionId, SessionState, ToolCallId, ToolName,
         UserInput,
@@ -196,26 +196,22 @@ async fn session_forwards_system_instructions_to_provider() {
 }
 
 #[tokio::test]
-async fn actor_forwards_system_instructions_across_turns() {
+async fn session_forwards_system_instructions_across_turns() {
     let directory = tempdir().unwrap();
     let provider = Arc::new(MockProvider::new(vec![
         MockResponse::Text("first".into()),
         MockResponse::Text("second".into()),
     ]));
-    let (handle, task) = spawn_with_system_instructions(
+    let mut session = Session::new(
         provider.clone(),
         Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
         Arc::new(mini_harness::tools::ToolRegistry::default()),
         Arc::new(InMemoryEventStore::default()),
-        "be concise",
     );
+    session.set_system_instructions("be concise");
 
-    let first = handle.start_turn(UserInput("one".into())).await.unwrap();
-    assert_eq!(handle.wait_turn(first).await.unwrap(), "first");
-    let second = handle.start_turn(UserInput("two".into())).await.unwrap();
-    assert_eq!(handle.wait_turn(second).await.unwrap(), "second");
-    handle.shutdown().await;
-    task.await.unwrap();
+    session.start_turn("one".into()).await.unwrap();
+    session.start_turn("two".into()).await.unwrap();
 
     assert_eq!(
         provider
@@ -348,8 +344,9 @@ async fn multiple_tool_calls_are_executed_in_event_order() {
         .read_from(mini_harness::runtime::EventSeq(1))
         .await
         .unwrap();
-    // 12 core facts + one provider continuation per tool-call response.
-    assert_eq!(events.len(), 14);
+    // 简化事件协议: 每个工具调用恰好 request + complete 两个事件。
+    // 10 core facts + one provider continuation per tool-call response.
+    assert_eq!(events.len(), 12);
     assert!(matches!(
         events[3].payload,
         EventPayload::ProviderContinuationUpdated { .. }
@@ -364,30 +361,22 @@ async fn multiple_tool_calls_are_executed_in_event_order() {
     ));
     assert!(matches!(
         events[6].payload,
-        EventPayload::ToolStarted { .. }
+        EventPayload::ToolCompleted { .. }
     ));
     assert!(matches!(
         events[7].payload,
-        EventPayload::ToolCompleted { .. }
-    ));
-    assert!(matches!(
-        events[8].payload,
         EventPayload::ToolRequested { .. }
     ));
     assert!(matches!(
-        events[9].payload,
-        EventPayload::ToolStarted { .. }
-    ));
-    assert!(matches!(
-        events[10].payload,
+        events[8].payload,
         EventPayload::ToolCompleted { .. }
     ));
     assert!(matches!(
-        events[12].payload,
+        events[10].payload,
         EventPayload::ModelResponseRecorded { .. }
     ));
     assert!(matches!(
-        events[13].payload,
+        events[11].payload,
         EventPayload::TurnCompleted { .. }
     ));
 }

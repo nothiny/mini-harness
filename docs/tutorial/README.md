@@ -1,5 +1,11 @@
 # mini-harness 教程：从一次请求读懂 Agent Harness
 
+> **注意（架构简化）**: 本仓库 `main`/`feature/simplify` 分支已经过教学化简化
+> （见 `SIMPLIFICATION_GUIDE.md`）：删除了 checkpoint、session actor、
+> durable queue 与 scheduler，合并了工具事件。本教程部分章节描述的是
+> **简化前**的实现，对应源码请切到 `bak` 分支对照阅读；核心概念
+> （事件溯源、reducer、进程组、审批）在两个版本中完全一致。
+
 这是一份**对照源码学习**的教程。目标不是让你背下几个术语，而是让你能打开这个仓库，沿着一次真实请求走完代码，并解释每一个边界为什么存在。
 
 你不需要先了解 Agent、事件溯源或分布式系统。只要会一点 Rust，愿意边读边运行命令，就可以从第 0 章开始。

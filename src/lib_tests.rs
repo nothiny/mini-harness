@@ -55,53 +55,28 @@ mod mock_turn_e2e {
             vec!["tool call: read", "done"]
         );
         let events = store.read_from(runtime::EventSeq(1)).await.unwrap();
-        // 9 core facts + the mock provider's continuation updates (one per
-        // tool-call response and one clearing it at the final text response).
-        assert_eq!(events.len(), 11);
-        assert!(matches!(
-            events[0].payload,
-            durable::EventPayload::SessionCreated
-        ));
-        assert!(matches!(
-            events[1].payload,
-            durable::EventPayload::UserInputRecorded { .. }
-        ));
-        assert!(matches!(
-            events[2].payload,
-            durable::EventPayload::TurnStarted
-        ));
-        assert!(matches!(
-            events[3].payload,
-            durable::EventPayload::ProviderContinuationUpdated { .. }
-        ));
-        assert!(matches!(
-            events[4].payload,
-            durable::EventPayload::ModelResponseRecorded { .. }
-        ));
-        assert!(matches!(
-            events[5].payload,
-            durable::EventPayload::ToolRequested { .. }
-        ));
-        assert!(matches!(
-            events[6].payload,
-            durable::EventPayload::ToolStarted { .. }
-        ));
-        assert!(matches!(
-            events[7].payload,
-            durable::EventPayload::ToolCompleted { .. }
-        ));
-        assert!(matches!(
-            events[8].payload,
-            durable::EventPayload::ProviderContinuationUpdated { .. }
-        ));
-        assert!(matches!(
-            events[9].payload,
-            durable::EventPayload::ModelResponseRecorded { .. }
-        ));
-        assert!(matches!(
-            events[10].payload,
-            durable::EventPayload::TurnCompleted { .. }
-        ));
+        // 简化事件协议: 每个工具调用恰好 request + complete 两个事件。
+        // 10 core facts = 6 turn facts + 2 tool facts + 2 continuation facts.
+        assert_eq!(events.len(), 10);
+        let kinds = events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "session.created",
+                "user.input.recorded",
+                "turn.started",
+                "provider.continuation.updated",
+                "model.response.recorded",
+                "tool.requested",
+                "tool.completed",
+                "provider.continuation.updated",
+                "model.response.recorded",
+                "turn.completed",
+            ]
+        );
     }
 }
 
@@ -157,7 +132,7 @@ mod jsonl_replay {
 
 #[cfg(test)]
 mod types_events {
-    use crate::durable::{Event, EventPayload};
+    use crate::durable::{Event, EventPayload, ToolOutcome};
     use crate::runtime::{EventSeq, ModelText, SessionId, ToolCallId, UserInput};
     use crate::*;
 
@@ -175,7 +150,6 @@ mod types_events {
         let session = SessionId::new();
         let turn = runtime::TurnId::new();
         let call = runtime::ToolCallId::new();
-        let execution = runtime::ExecutionId::new();
         let payloads = vec![
             EventPayload::SessionCreated,
             EventPayload::UserInputRecorded {
@@ -189,22 +163,29 @@ mod types_events {
                 call_id: call,
                 name: runtime::ToolName("read".into()),
                 input: serde_json::json!({"path":"a"}),
+                requires_approval: false,
             },
-            EventPayload::ToolStarted {
+            EventPayload::ToolApprovalResponded {
                 call_id: call,
-                execution_id: execution,
+                approved: true,
             },
             EventPayload::ToolCompleted {
                 call_id: call,
-                result: runtime::ToolResult("ok".into()),
+                outcome: ToolOutcome::Succeeded {
+                    result: runtime::ToolResult("ok".into()),
+                },
+                duration_ms: 12,
             },
-            EventPayload::ToolFailed {
+            EventPayload::ToolCompleted {
                 call_id: call,
-                error: crate::error::ToolError::from("failed"),
+                outcome: ToolOutcome::Rejected {
+                    error: crate::error::ToolError::from("rejected"),
+                },
+                duration_ms: 0,
             },
-            EventPayload::ToolPolicyDenied {
+            EventPayload::ToolOutcomeUnknown {
                 call_id: call,
-                reason: "policy denied tool `bash`".into(),
+                reason: "interrupted".into(),
             },
             EventPayload::TurnCompleted {
                 text: ModelText("done".into()),
@@ -232,8 +213,8 @@ mod types_events {
             EventPayload::SessionCreated,
         ))
         .unwrap();
-        value["schema_version"] = serde_json::json!(1);
-        assert!(Event::from_json(&value.to_string()).is_ok());
+        value["schema_version"] = serde_json::json!(2);
+        assert!(Event::from_json(&value.to_string()).is_err());
         value["schema_version"] = serde_json::json!(999);
         let error = Event::from_json(&value.to_string()).unwrap_err();
         assert!(matches!(error, error::DurableError::UnsupportedSchema(999)));
@@ -243,7 +224,7 @@ mod types_events {
 #[cfg(test)]
 mod error_types {
     use crate::error::ExecutionError;
-    use crate::runtime::{ExecutionId, ExecutionState, ToolResult};
+    use crate::runtime::{ExecutionState, ToolResult};
     #[test]
     fn execution_state_preserves_typed_failure_and_unknown() {
         let failed = ExecutionState::Failed {
@@ -264,18 +245,15 @@ mod error_types {
             result: ToolResult("ok".into()),
         };
         assert!(matches!(completed, ExecutionState::Completed { .. }));
-        let _running = ExecutionState::Running {
-            execution_id: ExecutionId::new(),
-        };
+        assert!(!matches!(completed, ExecutionState::Pending));
     }
 }
 
 #[cfg(test)]
 mod reducer_rules {
-    use crate::durable::{Event, EventPayload, reduce};
+    use crate::durable::{Event, EventPayload, ToolOutcome, reduce};
     use crate::runtime::{
-        EventSeq, ExecutionId, ModelText, SessionId, ToolCallId, ToolName, ToolResult, TurnId,
-        UserInput,
+        EventSeq, ModelText, SessionId, ToolCallId, ToolName, ToolResult, TurnId, UserInput,
     };
     use crate::*;
     fn event(session: SessionId, turn: Option<TurnId>, seq: u64, payload: EventPayload) -> Event {
@@ -284,7 +262,7 @@ mod reducer_rules {
         event
     }
     #[test]
-    fn reducer_rejects_completion_before_start_and_duplicate_completion() {
+    fn reducer_rejects_completion_before_approval_and_duplicate_completion() {
         let session = SessionId::new();
         let turn = TurnId::new();
         let call = ToolCallId::new();
@@ -306,41 +284,50 @@ mod reducer_rules {
                 4,
                 EventPayload::ToolRequested {
                     call_id: call,
-                    name: ToolName("read".into()),
+                    name: ToolName("bash".into()),
                     input: serde_json::json!({}),
-                },
-            ),
-            event(
-                session,
-                Some(turn),
-                5,
-                EventPayload::ToolCompleted {
-                    call_id: call,
-                    result: ToolResult("x".into()),
+                    requires_approval: true,
                 },
             ),
         ];
-        for event in events.iter().take(4) {
+        for event in events.iter() {
             reduce(&mut state, event).unwrap();
         }
-        assert!(reduce(&mut state, &events[4]).is_err());
-        let started = event(
+        // 审批还挂起时不能完成工具。
+        let early = event(
             session,
             Some(turn),
             5,
-            EventPayload::ToolStarted {
+            EventPayload::ToolCompleted {
                 call_id: call,
-                execution_id: ExecutionId::new(),
+                outcome: ToolOutcome::Succeeded {
+                    result: ToolResult("x".into()),
+                },
+                duration_ms: 0,
             },
         );
-        reduce(&mut state, &started).unwrap();
+        assert!(reduce(&mut state, &early).is_err());
+        // 用户批准后才能完成。
+        let approved = event(
+            session,
+            Some(turn),
+            5,
+            EventPayload::ToolApprovalResponded {
+                call_id: call,
+                approved: true,
+            },
+        );
+        reduce(&mut state, &approved).unwrap();
         let completed = event(
             session,
             Some(turn),
             6,
             EventPayload::ToolCompleted {
                 call_id: call,
-                result: ToolResult("x".into()),
+                outcome: ToolOutcome::Succeeded {
+                    result: ToolResult("x".into()),
+                },
+                duration_ms: 0,
             },
         );
         reduce(&mut state, &completed).unwrap();
@@ -350,7 +337,10 @@ mod reducer_rules {
             7,
             EventPayload::ToolCompleted {
                 call_id: call,
-                result: ToolResult("x".into()),
+                outcome: ToolOutcome::Succeeded {
+                    result: ToolResult("x".into()),
+                },
+                duration_ms: 0,
             },
         );
         assert!(reduce(&mut state, &duplicate).is_err());
@@ -394,6 +384,36 @@ mod reducer_rules {
             reduce(&mut b, event).unwrap();
         }
         assert_eq!(a, b);
+        assert_eq!(a.pending_input, None);
+    }
+    #[test]
+    fn reducer_rejects_input_while_a_turn_is_active() {
+        let session = SessionId::new();
+        let turn = TurnId::new();
+        let mut state = runtime::SessionState::new(session);
+        for event in [
+            event(session, None, 1, EventPayload::SessionCreated),
+            event(
+                session,
+                None,
+                2,
+                EventPayload::UserInputRecorded {
+                    input: UserInput("x".into()),
+                },
+            ),
+            event(session, Some(turn), 3, EventPayload::TurnStarted),
+        ] {
+            reduce(&mut state, &event).unwrap();
+        }
+        let queued = event(
+            session,
+            None,
+            4,
+            EventPayload::UserInputRecorded {
+                input: UserInput("too early".into()),
+            },
+        );
+        assert!(reduce(&mut state, &queued).is_err());
     }
 }
 
@@ -465,7 +485,7 @@ mod jsonl_regressions {
     use crate::durable::{Event, EventPayload, EventStore, JsonlEventStore, reduce};
     use crate::error::{DurableError, ToolError};
     use crate::runtime::{
-        EventSeq, ExecutionId, SessionId, SessionStatus, ToolCallId, ToolName, TurnId, UserInput,
+        EventSeq, SessionId, SessionStatus, ToolCallId, ToolName, TurnId, UserInput,
     };
     use crate::*;
     use tempfile::tempdir;
@@ -511,33 +531,26 @@ mod jsonl_regressions {
         ));
     }
     #[test]
-    fn reducer_allows_recovery_input_after_failure_but_not_close() {
-        for (status, should_accept) in [
-            (SessionStatus::Failed, true),
-            (SessionStatus::Closed, false),
-        ] {
-            let session = SessionId::new();
-            let mut state = runtime::SessionState::new(session);
-            reduce(
-                &mut state,
-                &numbered(Event::new(session, None, EventPayload::SessionCreated), 1),
-            )
-            .unwrap();
-            state.last_seq = EventSeq(1);
-            state.status = status;
-            let mut input = Event::new(
-                session,
-                None,
-                EventPayload::UserInputRecorded {
-                    input: UserInput("x".into()),
-                },
-            );
-            input.seq = EventSeq(2);
-            assert_eq!(reduce(&mut state, &input).is_ok(), should_accept);
-            if should_accept {
-                assert_eq!(state.status, SessionStatus::Idle);
-            }
-        }
+    fn reducer_allows_recovery_input_after_failure() {
+        let session = SessionId::new();
+        let mut state = runtime::SessionState::new(session);
+        reduce(
+            &mut state,
+            &numbered(Event::new(session, None, EventPayload::SessionCreated), 1),
+        )
+        .unwrap();
+        state.last_seq = EventSeq(1);
+        state.status = SessionStatus::Failed;
+        let mut input = Event::new(
+            session,
+            None,
+            EventPayload::UserInputRecorded {
+                input: UserInput("x".into()),
+            },
+        );
+        input.seq = EventSeq(2);
+        assert!(reduce(&mut state, &input).is_ok());
+        assert_eq!(state.status, SessionStatus::Idle);
     }
     #[test]
     fn reducer_keeps_tool_error_type() {
@@ -569,6 +582,7 @@ mod jsonl_regressions {
                         call_id: call,
                         name: ToolName("read".into()),
                         input: serde_json::json!({}),
+                        requires_approval: false,
                     },
                 ),
                 4,
@@ -577,48 +591,67 @@ mod jsonl_regressions {
                 Event::new(
                     session,
                     Some(turn),
-                    EventPayload::ToolStarted {
+                    EventPayload::ToolCompleted {
                         call_id: call,
-                        execution_id: ExecutionId::new(),
+                        outcome: crate::durable::ToolOutcome::Failed {
+                            error: ToolError::from("permission denied"),
+                        },
+                        duration_ms: 0,
                     },
                 ),
                 5,
-            ),
-            numbered(
-                Event::new(
-                    session,
-                    Some(turn),
-                    EventPayload::ToolFailed {
-                        call_id: call,
-                        error: ToolError::from("permission denied"),
-                    },
-                ),
-                6,
             ),
         ];
         for event in events {
             reduce(&mut state, &event).unwrap();
         }
         assert!(matches!(
-            state.active_turn.unwrap().executions.get(&call),
+            state.active_turn.as_ref().unwrap().executions.get(&call),
             Some(runtime::ExecutionState::Failed {
                 error: crate::error::ExecutionError::Tool { .. }
             })
         ));
+        // 执行后的失败可能已有副作用：阻塞 turn 完成。
+        let done = numbered(
+            Event::new(
+                session,
+                Some(turn),
+                EventPayload::ModelResponseRecorded {
+                    text: crate::runtime::ModelText("done".into()),
+                },
+            ),
+            6,
+        );
+        reduce(&mut state, &done).unwrap();
+        let completed = numbered(
+            Event::new(
+                session,
+                Some(turn),
+                EventPayload::TurnCompleted {
+                    text: crate::runtime::ModelText("done".into()),
+                },
+            ),
+            7,
+        );
+        assert!(reduce(&mut state, &completed).is_err());
     }
 }
 
 #[cfg(test)]
-mod session_actor {
+mod session_lifecycle {
     use crate::durable::EventStore;
     use crate::error::ProviderError;
     use crate::model::{MockProvider, MockResponse};
+    use crate::runtime::SessionStatus;
     use crate::runtime::session::Session;
-    use crate::runtime::{SessionStatus, UserInput};
     use crate::*;
     use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::tempdir;
+
+    fn executor(dir: &tempfile::TempDir) -> Arc<executor::LocalExecutor> {
+        Arc::new(executor::LocalExecutor::new(dir.path().into()))
+    }
+
     #[tokio::test]
     async fn provider_error_records_turn_failed() {
         let provider = Arc::new(MockProvider::new(vec![
@@ -629,7 +662,7 @@ mod session_actor {
         let dir = tempdir().unwrap();
         let mut session = Session::new(
             provider,
-            Arc::new(executor::LocalExecutor::new(dir.path().into())),
+            executor(&dir),
             Arc::new(tools::ToolRegistry::default()),
             store.clone(),
         );
@@ -644,49 +677,7 @@ mod session_actor {
         assert_eq!(session.state().status, SessionStatus::Idle);
         assert!(store.last_seq().await.unwrap().0 > 4);
     }
-    #[tokio::test]
-    async fn actor_queues_inputs_while_a_turn_runs_and_runs_them_in_order() {
-        let provider = Arc::new(MockProvider::new(vec![
-            MockResponse::Delay(Duration::from_millis(50)),
-            MockResponse::Text("one done".into()),
-            MockResponse::Text("two done".into()),
-        ]));
-        let dir = tempdir().unwrap();
-        let store = Arc::new(durable::InMemoryEventStore::default());
-        let (handle, task) = runtime::session::spawn(
-            provider,
-            Arc::new(executor::LocalExecutor::new(dir.path().into())),
-            Arc::new(tools::ToolRegistry::default()),
-            Arc::clone(&store),
-        );
-        let first_handle = handle.clone();
-        let first = tokio::spawn(async move {
-            first_handle
-                .start_turn(UserInput("one".into()))
-                .await
-                .unwrap()
-        });
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        // The running turn cannot append, so the input is recorded and
-        // acknowledged right after it ends — never dropped silently.
-        let (second_turn, queued) = handle
-            .start_turn_with_status(UserInput("two".into()))
-            .await
-            .unwrap();
-        assert!(queued, "input submitted during a turn must report queued");
-        let first_turn = first.await.unwrap();
-        assert_eq!(handle.wait_turn(first_turn).await.unwrap(), "one done");
-        // The queued turn auto-starts in order; its wait replies afterwards.
-        assert_eq!(handle.wait_turn(second_turn).await.unwrap(), "two done");
-        handle.shutdown().await;
-        task.await.unwrap();
-        assert!(
-            handle
-                .start_turn(UserInput("after shutdown".into()))
-                .await
-                .is_err()
-        );
-    }
+
     #[tokio::test]
     async fn mock_script_exhaustion_is_a_provider_error() {
         let provider = MockProvider::new(vec![]);
@@ -698,43 +689,99 @@ mod session_actor {
         .await;
         assert!(matches!(result, Err(ProviderError::Message { .. })));
     }
+
+    /// 简化版没有 durable queue: turn 运行中（或挂起审批中）的新输入被
+    /// 直接拒绝。
+    #[tokio::test]
+    async fn start_turn_is_rejected_while_another_turn_is_active() {
+        let call = crate::model::ToolCall {
+            call_id: runtime::ToolCallId::new(),
+            name: runtime::ToolName("bash".into()),
+            input: serde_json::json!({"command": "echo hi"}),
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            MockResponse::ToolCall(call),
+            MockResponse::Text("done".into()),
+        ]));
+        let dir = tempdir().unwrap();
+        let mut registry = tools::ToolRegistry::default();
+        registry.register(tools::BashTool::default()).unwrap();
+        let mut session = Session::new_with_policy(
+            provider,
+            executor(&dir),
+            Arc::new(registry),
+            Arc::new(durable::InMemoryEventStore::default()),
+            Arc::new(policy::DefaultPolicy),
+        );
+        // bash `echo hi` 是只读命令 → Allow，turn 正常完成。
+        session.start_turn("first".into()).await.unwrap();
+        // 人为构造挂起状态: edit 工具需要审批。
+        let edit_call = crate::model::ToolCall {
+            call_id: runtime::ToolCallId::new(),
+            name: runtime::ToolName("edit".into()),
+            input: serde_json::json!({
+                "path": "a.txt",
+                "old_text": "before",
+                "new_text": "after"
+            }),
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            MockResponse::ToolCall(edit_call),
+            MockResponse::Text("done".into()),
+        ]));
+        let mut registry = tools::ToolRegistry::default();
+        registry.register(tools::EditTool).unwrap();
+        let mut session = Session::new_with_policy(
+            provider,
+            executor(&dir),
+            Arc::new(registry),
+            Arc::new(durable::InMemoryEventStore::default()),
+            Arc::new(policy::DefaultPolicy),
+        );
+        tokio::fs::write(dir.path().join("a.txt"), "before")
+            .await
+            .unwrap();
+        let error = session.start_turn("edit it".into()).await.unwrap_err();
+        assert!(matches!(error, HarnessError::ApprovalPending(_)));
+        assert!(session.state().active_turn.is_some());
+        let rejected = session.start_turn("second".into()).await.unwrap_err();
+        assert!(matches!(rejected, HarnessError::TurnAlreadyActive));
+    }
 }
 
 #[cfg(test)]
 mod turn_lifecycle {
     use crate::durable::{EventPayload, EventStore};
     use crate::model::{MockProvider, MockResponse, ToolCall};
-    use crate::runtime::{SessionStatus, ToolCallId, ToolName, UserInput};
+    use crate::runtime::{SessionStatus, ToolCallId, ToolName};
     use crate::*;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
     #[tokio::test]
-    async fn cancel_turn_records_cancelled_without_completion() {
+    async fn turn_timeout_records_cancelled_without_completion() {
         let provider = Arc::new(MockProvider::new(vec![
             MockResponse::Delay(Duration::from_secs(5)),
             MockResponse::Text("late".into()),
         ]));
         let store = Arc::new(durable::InMemoryEventStore::default());
         let dir = tempdir().unwrap();
-        let (handle, actor) = runtime::session::spawn(
+        let mut session = runtime::session::Session::new(
             provider,
             Arc::new(executor::LocalExecutor::new(dir.path().into())),
             Arc::new(tools::ToolRegistry::default()),
             store.clone(),
         );
-        let turn = handle
-            .start_turn(UserInput("cancel me".into()))
+        let error = session
+            .start_turn_with_timeout("cancel me".into(), Duration::from_millis(100))
             .await
-            .unwrap();
-        handle.cancel_turn(turn).await.unwrap();
-        handle.shutdown().await;
-        actor.await.unwrap();
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Timeout));
         let events = store.read_from(runtime::EventSeq(1)).await.unwrap();
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event.payload, EventPayload::TurnCancelled))
+                .any(|event| matches!(event.payload, EventPayload::TurnTimedOut))
         );
         assert!(
             !events
@@ -761,50 +808,18 @@ mod turn_lifecycle {
         assert!(session.start_turn("invoke missing".into()).await.is_err());
         assert_eq!(session.state().status, SessionStatus::Failed);
         let events = store.read_from(runtime::EventSeq(1)).await.unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.payload, EventPayload::ToolFailed { .. }))
-        );
+        // 未知工具在执行前被拒绝（Rejected），turn 因脚本耗尽而失败。
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::ToolCompleted {
+                outcome: durable::ToolOutcome::Rejected { .. },
+                ..
+            }
+        )));
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event.payload, EventPayload::TurnFailed { .. }))
         );
-    }
-}
-
-#[cfg(test)]
-mod session_actor_contract {
-    use crate::error::HarnessError;
-    use crate::model::{MockProvider, MockResponse};
-    use crate::runtime::UserInput;
-    use crate::*;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    #[tokio::test]
-    async fn wait_turn_observes_provider_failure_after_start_ack() {
-        let provider = Arc::new(MockProvider::new(vec![
-            MockResponse::Error("provider down".into()),
-            MockResponse::Text("recovered".into()),
-        ]));
-        let store = Arc::new(durable::InMemoryEventStore::default());
-        let dir = tempdir().unwrap();
-        let (handle, actor) = runtime::session::spawn(
-            provider,
-            Arc::new(executor::LocalExecutor::new(dir.path().into())),
-            Arc::new(tools::ToolRegistry::default()),
-            store,
-        );
-        let turn = handle.start_turn(UserInput("hello".into())).await.unwrap();
-        let error = handle.wait_turn(turn).await.unwrap_err();
-        assert!(matches!(&*error, HarnessError::Provider(_)));
-        let retry = handle
-            .start_turn(UserInput("after failure".into()))
-            .await
-            .unwrap();
-        assert_eq!(handle.wait_turn(retry).await.unwrap(), "recovered");
-        handle.shutdown().await;
-        actor.await.unwrap();
     }
 }

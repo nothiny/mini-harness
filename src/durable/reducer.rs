@@ -1,6 +1,6 @@
-use super::event::{Event, EventPayload};
+use super::event::{Event, EventPayload, ToolOutcome};
 use crate::{
-    error::{HarnessError, ToolError},
+    error::HarnessError,
     runtime::{
         state::{ApprovalStatus, HistoryItem, SessionState, SessionStatus, TurnState, TurnStatus},
         types::ExecutionState,
@@ -59,6 +59,30 @@ fn reset_provider_cursor(state: &mut SessionState) {
     state.provider_continuation = Some(continuation);
 }
 
+/// 确定性 Reducer: 从事件流重建完整状态。
+///
+/// **核心不变量**: 相同的事件序列 → 相同的状态（无论重放多少次）。
+///
+/// 这是 Event Sourcing 的核心：状态是事件的"折叠"(fold)。
+///
+/// # 为什么需要确定性？
+///
+/// 1. **崩溃恢复**: 进程崩溃后，从事件日志重放即可恢复到崩溃前状态
+/// 2. **时间旅行**: 可以重放到任意历史时刻，用于调试
+/// 3. **一致性**: 多个进程读取同一事件日志，得到相同的状态视图
+///
+/// # 如何保证确定性？
+///
+/// - ❌ 不使用 `Instant::now()`（时间是外部输入）
+/// - ❌ 不使用 `rand::random()`（随机数是不可重现的）
+/// - ✅ 所有时间戳来自事件本身的 `timestamp` 字段
+/// - ✅ 所有随机性来自模型响应（已记录在事件中）
+///
+/// # 非法转换直接报错
+///
+/// Reducer 不修复坏日志，而是失败 —— 让调用方决定如何处置。
+/// 例如: `tool.completed` 引用一个不存在的 call_id、事件序号断裂、
+/// turn 未结束就开启新 turn 等。
 pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessError> {
     if event.session_id != state.session_id {
         return Err(HarnessError::InvariantViolation(
@@ -87,25 +111,16 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             state.status = SessionStatus::Idle;
             Ok(())
         }
-        EventPayload::UserInputRecorded { input }
-            if state.active_turn.is_some() && event.turn_id.is_none() =>
-        {
-            // Durable input queue (design §7.4 second phase / §12): the input
-            // becomes part of the conversation immediately — so the running
-            // turn's next sampling round sees it as a steer — and stays in
-            // `pending_inputs` so the next `turn.started` consumes it in
-            // order. Nothing is dropped silently.
-            push_history(state, HistoryItem::User(input.clone()))?;
-            state.pending_inputs.push_back(input.clone());
-            Ok(())
-        }
+        // 简化版没有 durable queue: turn 运行中（或还有未消费的输入时）
+        // 记录新输入是非法转换，由 AgentLoop 在追加前直接拒绝。
         EventPayload::UserInputRecorded { input }
             if state.active_turn.is_none()
+                && state.pending_input.is_none()
                 && event.turn_id.is_none()
                 && matches!(state.status, SessionStatus::Idle | SessionStatus::Failed) =>
         {
             push_history(state, HistoryItem::User(input.clone()))?;
-            state.pending_inputs.push_back(input.clone());
+            state.pending_input = Some(input.clone());
             // A failed turn is terminal for that turn, but does not poison
             // the session forever. Recording a new user input is the
             // explicit recovery transition back to the idle state.
@@ -116,23 +131,12 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             let id = event
                 .turn_id
                 .ok_or_else(|| HarnessError::InvariantViolation("missing turn id".into()))?;
-            if state.pending_inputs.pop_front().is_none() {
+            if state.pending_input.take().is_none() {
                 return Err(HarnessError::InvariantViolation(
                     "turn started without user input".into(),
                 ));
             }
-            state.active_turn = Some(TurnState {
-                turn_id: id,
-                status: TurnStatus::Running,
-                last_model_response: None,
-                tool_calls: vec![],
-                executions: Default::default(),
-                tool_names: Default::default(),
-                tool_inputs: Default::default(),
-                rejected_tool_calls: Default::default(),
-                approvals: Default::default(),
-                final_text: None,
-            });
+            state.active_turn = Some(TurnState::new(id));
             state.status = SessionStatus::Running;
             Ok(())
         }
@@ -161,6 +165,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             call_id,
             name,
             input,
+            requires_approval,
         } => {
             let turn = active_turn_mut(state, event)?;
             if turn.executions.contains_key(call_id) {
@@ -172,82 +177,8 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             turn.tool_names.insert(*call_id, name.clone());
             turn.tool_inputs.insert(*call_id, input.clone());
             turn.executions.insert(*call_id, ExecutionState::Pending);
-            Ok(())
-        }
-        EventPayload::ToolStarted {
-            call_id,
-            execution_id,
-        } => {
-            let turn = active_turn_mut(state, event)?;
-            match turn.executions.get(call_id) {
-                Some(ExecutionState::Pending) => {}
-                Some(_) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool started more than once".into(),
-                    ));
-                }
-                None => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool started before request".into(),
-                    ));
-                }
-            };
-            match turn.approvals.get(call_id) {
-                Some(ApprovalStatus::Approved) | None => {}
-                Some(ApprovalStatus::Pending) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool started before approval".into(),
-                    ));
-                }
-                Some(ApprovalStatus::Denied) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool started after approval was denied".into(),
-                    ));
-                }
-            }
-            turn.executions.insert(
-                *call_id,
-                ExecutionState::Running {
-                    execution_id: *execution_id,
-                },
-            );
-            Ok(())
-        }
-        EventPayload::ToolApprovalRequested { call_id } => {
-            let turn = active_turn_mut(state, event)?;
-            match turn.executions.get(call_id) {
-                Some(ExecutionState::Pending) => {}
-                Some(_) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "approval requested for a non-pending tool".into(),
-                    ));
-                }
-                None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
-            }
-            if turn
-                .approvals
-                .insert(*call_id, ApprovalStatus::Pending)
-                .is_some()
-            {
-                return Err(HarnessError::InvariantViolation(
-                    "approval requested more than once".into(),
-                ));
-            }
-            Ok(())
-        }
-        EventPayload::ToolBatchDeferred {
-            call_ids,
-            reason: _,
-        } => {
-            let turn = active_turn_mut(state, event)?;
-            if call_ids.is_empty()
-                || call_ids
-                    .iter()
-                    .any(|call_id| turn.executions.contains_key(call_id))
-            {
-                return Err(HarnessError::InvariantViolation(
-                    "invalid deferred tool batch".into(),
-                ));
+            if *requires_approval {
+                turn.approvals.insert(*call_id, ApprovalStatus::Pending);
             }
             Ok(())
         }
@@ -262,7 +193,7 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                 }
                 None => {
                     return Err(HarnessError::InvariantViolation(
-                        "approval response without request".into(),
+                        "approval response for a tool that never asked".into(),
                     ));
                 }
             }
@@ -276,76 +207,30 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             );
             Ok(())
         }
-        EventPayload::ToolPolicyDenied { call_id, reason } => {
+        EventPayload::ToolCompleted {
+            call_id,
+            outcome,
+            duration_ms: _,
+        } => {
             let turn = active_turn_mut(state, event)?;
             match turn.executions.get(call_id) {
                 Some(ExecutionState::Pending) => {}
                 Some(_) => {
                     return Err(HarnessError::InvariantViolation(
-                        "policy denied tool after execution was finalized".into(),
+                        "tool completed after execution was finalized".into(),
                     ));
                 }
                 None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
+            };
+            // 带审批的调用必须先收到用户的决定才能执行。
+            if matches!(turn.approvals.get(call_id), Some(ApprovalStatus::Pending)) {
+                return Err(HarnessError::InvariantViolation(
+                    "tool completed while approval is still pending".into(),
+                ));
             }
-            // A policy denial is not an approval decision: the approvals map
-            // is untouched so replay cannot mistake it for a user response.
-            turn.executions.insert(
-                *call_id,
-                ExecutionState::Failed {
-                    error: crate::error::ExecutionError::Tool {
-                        error: ToolError::from(reason.clone()),
-                    },
-                },
-            );
-            Ok(())
-        }
-        EventPayload::ToolCompleted { call_id, result } => {
-            let turn = active_turn_mut(state, event)?;
-            match turn.executions.get(call_id) {
-                Some(ExecutionState::Running { .. }) => {}
-                Some(_) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool completed without running execution".into(),
-                    ));
-                }
-                None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
-            };
-            let tool_name = turn
-                .tool_names
-                .get(call_id)
-                .cloned()
-                .ok_or_else(|| HarnessError::InvariantViolation("missing tool name".into()))?;
-            let tool_input = turn.tool_inputs.get(call_id).cloned().unwrap_or_default();
-            turn.executions.insert(
-                *call_id,
-                ExecutionState::Completed {
-                    result: result.clone(),
-                },
-            );
-            push_history(
-                state,
-                HistoryItem::Tool {
-                    call_id: *call_id,
-                    name: tool_name,
-                    input: tool_input,
-                    result: result.clone(),
-                },
-            )
-        }
-        EventPayload::ToolFailed { call_id, error } => {
-            let turn = active_turn_mut(state, event)?;
-            match turn.executions.get(call_id) {
-                Some(ExecutionState::Pending | ExecutionState::Running { .. }) => {}
-                Some(_) => {
-                    return Err(HarnessError::InvariantViolation(
-                        "tool failed after execution was finalized".into(),
-                    ));
-                }
-                None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
-            };
-            if matches!(turn.executions.get(call_id), Some(ExecutionState::Pending))
-                && !matches!(turn.approvals.get(call_id), Some(ApprovalStatus::Denied))
-            {
+            // 在副作用可能发生前就被拒绝的调用（校验失败）允许模型在
+            // 后续步骤中重试；执行后的失败则阻塞 turn 完成。
+            if matches!(outcome, ToolOutcome::Rejected { .. }) {
                 turn.rejected_tool_calls.insert(*call_id);
             }
             let tool_name = turn
@@ -356,10 +241,17 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
             let tool_input = turn.tool_inputs.get(call_id).cloned().unwrap_or_default();
             turn.executions.insert(
                 *call_id,
-                ExecutionState::Failed {
-                    error: crate::error::ExecutionError::Tool {
-                        error: error.clone(),
+                match outcome {
+                    ToolOutcome::Succeeded { result } => ExecutionState::Completed {
+                        result: result.clone(),
                     },
+                    ToolOutcome::Rejected { error } | ToolOutcome::Failed { error } => {
+                        ExecutionState::Failed {
+                            error: crate::error::ExecutionError::Tool {
+                                error: error.clone(),
+                            },
+                        }
+                    }
                 },
             );
             push_history(
@@ -368,63 +260,23 @@ pub fn reduce(state: &mut SessionState, event: &Event) -> Result<(), HarnessErro
                     call_id: *call_id,
                     name: tool_name,
                     input: tool_input,
-                    result: crate::runtime::ToolResult(error.to_string()),
+                    result: outcome.as_tool_result(),
                 },
             )
         }
         EventPayload::ToolOutcomeUnknown { call_id, reason: _ } => {
             let turn = active_turn_mut(state, event)?;
             match turn.executions.get(call_id) {
-                Some(ExecutionState::Running { .. }) => {}
+                Some(ExecutionState::Pending) => {}
                 Some(_) => {
                     return Err(HarnessError::InvariantViolation(
-                        "tool outcome marked unknown without a running execution".into(),
+                        "tool outcome marked unknown after execution was finalized".into(),
                     ));
                 }
                 None => return Err(HarnessError::InvariantViolation("unknown tool call".into())),
-            }
+            };
             turn.executions
                 .insert(*call_id, ExecutionState::OutcomeUnknown);
-            Ok(())
-        }
-        EventPayload::RecoveryStarted { reason: _ }
-        | EventPayload::RecoveryCompleted { summary: _ }
-        | EventPayload::CheckpointCreated => {
-            if event.turn_id.is_some() {
-                return Err(HarnessError::InvariantViolation(
-                    "durable lifecycle event cannot belong to a turn".into(),
-                ));
-            }
-            Ok(())
-        }
-        EventPayload::RecoveryActionRequired { call_id, policy: _ } => {
-            if let Some(call_id) = call_id {
-                let turn = active_turn_mut(state, event)?;
-                match turn.executions.get(call_id) {
-                    Some(
-                        ExecutionState::Pending
-                        | ExecutionState::Running { .. }
-                        | ExecutionState::OutcomeUnknown,
-                    ) => {}
-                    Some(_) => {
-                        return Err(HarnessError::InvariantViolation(
-                            "recovery action references a completed tool call".into(),
-                        ));
-                    }
-                    None => {
-                        return Err(HarnessError::InvariantViolation(
-                            "recovery action references an unknown tool call".into(),
-                        ));
-                    }
-                }
-            } else {
-                if event.turn_id.is_none() {
-                    return Err(HarnessError::InvariantViolation(
-                        "recovery action without a turn id".into(),
-                    ));
-                }
-                let _ = active_turn_mut(state, event)?;
-            }
             Ok(())
         }
         EventPayload::TurnCompleted { text } => {

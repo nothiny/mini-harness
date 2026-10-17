@@ -1,0 +1,18 @@
+[package]
+name = "mini-harness-benchmark"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Benchmark runner for mini-harness (optional companion crate)"
+
+[dependencies]
+mini-harness = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

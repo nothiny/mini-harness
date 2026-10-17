@@ -10,7 +10,7 @@
 //!   classifies the session as clean.
 
 use mini_harness::{
-    durable::{EventPayload, EventStore, JsonlEventStore, inspect_store},
+    durable::{EventPayload, EventStore, JsonlEventStore, reduce},
     executor::LocalExecutor,
     model::{MockProvider, MockResponse},
     policy::DefaultPolicy,
@@ -112,10 +112,11 @@ async fn cross_process_cancel_stops_the_runner_without_overwriting_the_log() {
         "the runner must not append anything after the cross-process cancel"
     );
 
-    // And recovery sees a terminated, clean session.
-    let report = inspect_store(canceller_store.as_ref(), session_id)
-        .await
-        .unwrap();
-    assert!(report.is_clean(), "findings: {:?}", report.findings);
-    assert!(report.state.active_turn.is_none());
+    // And replaying the log yields a terminated, clean session.
+    let mut replayed = mini_harness::runtime::SessionState::new(session_id);
+    for event in &events {
+        reduce(&mut replayed, event).unwrap();
+    }
+    assert!(replayed.active_turn.is_none());
+    assert_eq!(replayed.last_seq, events.last().unwrap().seq);
 }

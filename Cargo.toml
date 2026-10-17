@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "mini-harness-server", "mini-harness-benchmark"]
+
 [package]
 name = "mini-harness"
 version = "0.1.0"

@@ -1,9 +1,11 @@
 use super::{
     ids::{SessionId, ToolCallId, TurnId},
-    types::{EventSeq, ExecutionState, ModelText, ToolName, ToolResult, UserInput},
+    types::{EventSeq, ModelText, ToolName, ToolResult, UserInput},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+
+use super::types::ExecutionState;
 
 /// Provider-owned cursor used to continue a response after tool execution.
 ///
@@ -37,7 +39,6 @@ pub enum SessionStatus {
     Idle,
     Running,
     Failed,
-    Closed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TurnStatus {
@@ -61,15 +62,13 @@ pub struct TurnState {
     pub status: TurnStatus,
     pub last_model_response: Option<ModelText>,
     pub tool_calls: Vec<ToolCallId>,
+    /// 每个工具调用的执行状态机（Pending → Completed/Failed/OutcomeUnknown）。
     pub executions: HashMap<ToolCallId, ExecutionState>,
     pub tool_names: HashMap<ToolCallId, ToolName>,
-    /// Inputs were added after checkpoint schema 1.  Keep the field
-    /// deserializable when restoring an old snapshot; the reducer fills it
-    /// for requests that are replayed after the snapshot.
-    #[serde(default)]
     pub tool_inputs: HashMap<ToolCallId, serde_json::Value>,
-    /// Calls rejected before execution can be corrected by a later model
-    /// response. Keep them distinct from failures after an effect may occur.
+    /// Calls rejected before execution (validation failures, denials) can be
+    /// corrected by a later model response. Keep them distinct from failures
+    /// after an effect may occur.
     #[serde(default)]
     pub rejected_tool_calls: HashSet<ToolCallId>,
     pub approvals: HashMap<ToolCallId, ApprovalStatus>,
@@ -77,9 +76,7 @@ pub struct TurnState {
 }
 
 impl TurnState {
-    /// Creates an empty running turn. Event replay remains the source of
-    /// truth; this helper is for integrations that need a migration-safe
-    /// initial value instead of a struct literal.
+    /// Creates an empty running turn.
     pub fn new(turn_id: TurnId) -> Self {
         Self {
             turn_id,
@@ -95,49 +92,6 @@ impl TurnState {
         }
     }
 }
-/// Where a session is in the scheduler lifecycle (design §12):
-/// `Idle → RunningTurn → WaitingApproval → RunningTool → RunningTurn → Idle`.
-///
-/// Lives next to the reducer state so the session actor can answer state
-/// queries without depending on the scheduler module.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionRunState {
-    Idle,
-    RunningTurn { turn_id: TurnId },
-    WaitingApproval { turn_id: TurnId },
-    RunningTool { turn_id: TurnId },
-}
-
-/// Projects reducer state onto [`SessionRunState`]. Approval wins over tool
-/// execution because an approved tool keeps running while later calls may
-/// still wait for their own approvals.
-pub fn run_state(state: &SessionState) -> SessionRunState {
-    let Some(turn) = &state.active_turn else {
-        return SessionRunState::Idle;
-    };
-    let waiting_approval = turn
-        .approvals
-        .iter()
-        .any(|(_, status)| matches!(status, ApprovalStatus::Pending));
-    if waiting_approval {
-        return SessionRunState::WaitingApproval {
-            turn_id: turn.turn_id,
-        };
-    }
-    let running_tool = turn
-        .executions
-        .values()
-        .any(|execution| matches!(execution, ExecutionState::Running { .. }));
-    if running_tool {
-        return SessionRunState::RunningTool {
-            turn_id: turn.turn_id,
-        };
-    }
-    SessionRunState::RunningTurn {
-        turn_id: turn.turn_id,
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HistoryItem {
     User(UserInput),
@@ -146,19 +100,25 @@ pub enum HistoryItem {
         call_id: ToolCallId,
         name: ToolName,
         /// Original arguments are required when stateless providers replay
-        /// assistant tool calls. Legacy snapshots did not retain this field.
+        /// assistant tool calls.
         #[serde(default)]
         input: serde_json::Value,
         result: ToolResult,
     },
 }
+
+/// Reducer 重建的全部会话状态。
+///
+/// 状态 = fold(events)。同一事件序列重放任意次都得到相同的状态。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: SessionId,
     pub status: SessionStatus,
     pub active_turn: Option<TurnState>,
     pub history: Vec<HistoryItem>,
-    pub pending_inputs: VecDeque<UserInput>,
+    /// 已记录但尚未被 `turn.started` 消费的输入。简化版一次只允许一个：
+    /// turn 运行期间到达的新输入会被直接拒绝。
+    pub pending_input: Option<UserInput>,
     #[serde(default)]
     pub provider_continuation: Option<ProviderContinuation>,
     pub last_seq: EventSeq,
@@ -174,15 +134,10 @@ impl SessionState {
             status: SessionStatus::Idle,
             active_turn: None,
             history: vec![],
-            pending_inputs: VecDeque::new(),
+            pending_input: None,
             provider_continuation: None,
             last_seq: EventSeq(0),
             history_bytes: 2,
         }
-    }
-
-    pub(crate) fn rebuild_history_bytes(&mut self) -> Result<(), serde_json::Error> {
-        self.history_bytes = serde_json::to_vec(&self.history)?.len();
-        Ok(())
     }
 }

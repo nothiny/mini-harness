@@ -24,10 +24,8 @@ pub enum HarnessError {
     Timeout,
     #[error("invariant violation: {0}")]
     InvariantViolation(String),
-    #[error("turn already active")]
+    #[error("turn already active; wait for the running turn to finish or cancel it")]
     TurnAlreadyActive,
-    #[error("input queue is full; the session cannot accept more queued inputs")]
-    QueueLimitExceeded,
 }
 
 macro_rules! message_error {
@@ -184,6 +182,4 @@ pub enum DurableError {
     LimitExceeded(String),
     #[error("unsupported event schema version {0}")]
     UnsupportedSchema(u32),
-    #[error("checkpoint error: {0}")]
-    Checkpoint(String),
 }

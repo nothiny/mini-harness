@@ -1,4 +1,4 @@
-//! Effective configuration for the harness (design §16).
+//! Effective configuration for the harness.
 //!
 //! The documented TOML file is the configuration boundary:
 //!
@@ -19,7 +19,6 @@
 //! [durable]
 //! root = "~/.mini-harness"
 //! flush = "buffered"
-//! checkpoint_every_events = 50
 //!
 //! [permissions]
 //! read_workspace = "allow"
@@ -34,7 +33,7 @@
 use crate::{
     error::ConfigError,
     policy::{PermissionMode, ToolPolicy},
-    runtime::{ids::SessionId, types::WorkspaceRoot},
+    runtime::ids::SessionId,
     tools::ToolSpec,
 };
 use serde::{Deserialize, Serialize};
@@ -146,12 +145,6 @@ pub struct DurableConfig {
     pub root: Option<PathBuf>,
     #[serde(default)]
     pub flush: FlushMode,
-    #[serde(default = "default_checkpoint_every_events")]
-    pub checkpoint_every_events: u64,
-}
-
-fn default_checkpoint_every_events() -> u64 {
-    50
 }
 
 impl Default for DurableConfig {
@@ -159,7 +152,6 @@ impl Default for DurableConfig {
         Self {
             root: None,
             flush: FlushMode::Buffered,
-            checkpoint_every_events: default_checkpoint_every_events(),
         }
     }
 }
@@ -272,13 +264,6 @@ impl HarnessConfig {
         self.session_dir(session_id).join("events.jsonl")
     }
 
-    /// `<root>/sessions/<session-id>/checkpoints/latest.json`.
-    pub fn session_checkpoint(&self, session_id: SessionId) -> PathBuf {
-        self.session_dir(session_id)
-            .join("checkpoints")
-            .join("latest.json")
-    }
-
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self)
             .map_err(|error| ConfigError::from(format!("cannot serialize config: {error}")))
@@ -335,7 +320,7 @@ pub fn resolve_event_log(config: &HarnessConfig, reference: &str) -> PathBuf {
     PathBuf::from(reference)
 }
 
-/// Policy driven by the `[permissions]` config section (design §10.3).
+/// Policy driven by the `[permissions]` config section.
 #[derive(Clone, Debug, Default)]
 pub struct ConfiguredPolicy {
     pub permissions: PermissionsConfig,
@@ -348,36 +333,16 @@ impl ConfiguredPolicy {
 }
 
 impl ToolPolicy for ConfiguredPolicy {
-    fn decide(
-        &self,
-        spec: &ToolSpec,
-        input: &serde_json::Value,
-        workspace: Option<&WorkspaceRoot>,
-    ) -> crate::policy::PolicyDecision {
+    fn decide(&self, spec: &ToolSpec, _input: &serde_json::Value) -> crate::policy::PolicyDecision {
         use crate::policy::PolicyDecision;
         let mode = match spec.risk {
             crate::tools::RiskClass::Read => self.permissions.read_workspace,
             crate::tools::RiskClass::Write => self.permissions.edit_workspace,
             crate::tools::RiskClass::Execute => self.permissions.bash,
         };
-        // Path-scoped tools stay bound to the workspace regardless of the
-        // configured mode: outside paths are always denied (fail closed).
-        let path_scoped = matches!(
-            spec.risk,
-            crate::tools::RiskClass::Read | crate::tools::RiskClass::Write
-        );
-        if path_scoped {
-            let Some(workspace) = workspace else {
-                return PolicyDecision::Deny;
-            };
-            if !crate::policy::path_is_within_workspace(input, workspace) {
-                return PolicyDecision::Deny;
-            }
-        }
         match mode {
             PermissionMode::Allow => PolicyDecision::Allow,
             PermissionMode::Ask => PolicyDecision::Ask,
-            PermissionMode::Deny => PolicyDecision::Deny,
         }
     }
 }

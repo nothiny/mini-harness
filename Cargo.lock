@@ -757,6 +757,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "mini-harness-benchmark"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "mini-harness",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "mini-harness-server"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "mini-harness",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

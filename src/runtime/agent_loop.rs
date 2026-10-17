@@ -1,5 +1,5 @@
 use crate::{
-    durable::{Event, EventPayload, EventStore, reduce},
+    durable::{Event, EventPayload, EventStore, ToolOutcome, reduce},
     error::{HarnessError, ProviderError},
     executor::Executor,
     model::{ModelProvider, ModelRequest, ModelResponse},
@@ -37,10 +37,6 @@ pub struct AgentLoopConfig {
     /// appended, so a misbehaving provider cannot grow per-turn state without
     /// bound.
     pub max_batch_tool_calls: usize,
-    /// Maximum inputs accepted while a turn is running (the durable queue,
-    /// design §12). Rejections happen before anything is appended, so a
-    /// refused input is never acknowledged or silently dropped.
-    pub max_queued_inputs: usize,
     pub max_context_bytes: usize,
     pub max_event_bytes: usize,
     pub max_tool_result_bytes: usize,
@@ -53,7 +49,6 @@ impl Default for AgentLoopConfig {
             max_turn_duration: Duration::from_secs(10 * 60),
             max_tool_time: Duration::from_secs(5 * 60),
             max_batch_tool_calls: DEFAULT_MAX_BATCH_TOOL_CALLS,
-            max_queued_inputs: DEFAULT_MAX_QUEUED_INPUTS,
             max_context_bytes: 1024 * 1024,
             max_event_bytes: 1024 * 1024,
             max_tool_result_bytes: DEFAULT_TOOL_OUTPUT_LIMIT,
@@ -62,7 +57,6 @@ impl Default for AgentLoopConfig {
 }
 
 pub(super) const DEFAULT_MAX_BATCH_TOOL_CALLS: usize = 16;
-pub(super) const DEFAULT_MAX_QUEUED_INPUTS: usize = 16;
 
 /// Sentinel for "no deadline". A far-future instant keeps deadline arithmetic
 /// in `select!` arms simple instead of threading `Option<Instant>` through
@@ -114,6 +108,41 @@ pub(super) fn turn_deadline_for(started_at: Instant, limit: Duration) -> Instant
     started_at + effective
 }
 
+/// Agent Loop: 模型-工具循环的核心实现。
+///
+/// # 执行流程
+///
+/// ```text
+/// ┌─────────────────────────────────────┐
+/// │  1. Sample 模型                      │
+/// │     ↓                               │
+/// │  2. 解析响应                         │
+/// │     ├─→ 文本回答 → 结束 Turn        │
+/// │     └─→ 工具调用 → 继续             │
+/// │           ↓                         │
+/// │  3. 执行工具（带审批）               │
+/// │     ↓                               │
+/// │  4. 追加结果到 context              │
+/// │     ↓                               │
+/// │  5. 返回步骤 1（直到达到 max_steps） │
+/// └─────────────────────────────────────┘
+/// ```
+///
+/// # 为什么需要步数限制？
+///
+/// 防止模型陷入无限循环（例如反复调用同一工具）。
+///
+/// # 为什么需要工具审批？
+///
+/// 防止模型执行危险操作（例如 `bash rm -rf /`）。
+///
+/// # 事件协议
+///
+/// 每次工具调用恰好追加两类事件：
+/// `tool.requested`（含 `requires_approval`）→ 执行 → `tool.completed`
+/// （成功或失败合并记录）。`ask` 工具在执行前额外获得一个
+/// `tool.approval.responded` 事件，并且 turn 以 [`HarnessError::ApprovalPending`]
+/// 暂停，直到用户通过 [`AgentLoop::approve_tool`] 恢复。
 pub struct AgentLoop<P, E, S> {
     pub provider: Arc<P>,
     pub executor: Arc<E>,
@@ -133,6 +162,11 @@ where
     E: Executor + 'static,
     S: EventStore + 'static,
 {
+    /// 追加一个事件: 校验 → 持久化 → 提交状态转换。
+    ///
+    /// 顺序是关键：先确认 store 与内存状态同步（另一个进程可能已经
+    /// 写入了终止事件，例如跨进程 cancel），再把事件交给 reducer
+    /// 预演，全部通过后才真正落盘并更新内存状态。
     pub(super) async fn append(
         &mut self,
         turn: Option<TurnId>,
@@ -205,6 +239,7 @@ where
         }
         self.append(Some(turn), reason.event()).await
     }
+    /// 运行一个完整 turn: 记录输入 → 循环采样直到模型给出最终文本。
     pub async fn run_turn(&mut self, input: String) -> Result<(TurnId, String), HarnessError> {
         self.run_turn_with_cancel(input, CancellationToken::new())
             .await
@@ -264,6 +299,12 @@ where
         self.continue_turn_with_reason(turn, cancel, cancellation_reason)
             .await
     }
+
+    /// 记录用户输入并启动 turn。
+    ///
+    /// 简化版没有 durable queue：一次只允许一个 turn，运行中（或还有
+    /// 未消费输入时）到达的新输入以 [`HarnessError::TurnAlreadyActive`]
+    /// 直接拒绝。
     pub async fn begin_turn(&mut self, turn: TurnId, input: String) -> Result<(), HarnessError> {
         if self.state.active_turn.is_some() {
             return Err(HarnessError::TurnAlreadyActive);
@@ -283,49 +324,14 @@ where
             },
         )
         .await?;
-        self.begin_queued_turn(turn).await
-    }
-
-    /// Records an input durably while a turn is running (durable queue,
-    /// design §12). The input becomes visible to the running turn's next
-    /// sampling round and is consumed in order by a later
-    /// [`Self::begin_queued_turn`].
-    pub async fn queue_input(&mut self, input: String) -> Result<(), HarnessError> {
-        if input.len() > MAX_CONTEXT_ITEM_BYTES {
-            return Err(HarnessError::InvariantViolation(format!(
-                "user input exceeds the {MAX_CONTEXT_ITEM_BYTES} byte context-item limit"
-            )));
-        }
-        if self.state.last_seq.0 == 0 {
-            self.append(None, EventPayload::SessionCreated).await?;
-        }
-        self.append(
-            None,
-            EventPayload::UserInputRecorded {
-                input: crate::runtime::UserInput(input),
-            },
-        )
-        .await
-    }
-
-    /// Starts a turn for an input that was already recorded durably
-    /// (append `turn.started`, consuming the front of `pending_inputs`).
-    pub async fn begin_queued_turn(&mut self, turn: TurnId) -> Result<(), HarnessError> {
-        if self.state.active_turn.is_some() {
-            return Err(HarnessError::TurnAlreadyActive);
-        }
-        if self.state.pending_inputs.is_empty() {
-            return Err(HarnessError::InvariantViolation(
-                "turn started without user input".into(),
-            ));
-        }
         self.append(Some(turn), EventPayload::TurnStarted).await?;
         self.turn_started_at = Some(Instant::now());
         self.turn_steps = 0;
         self.tool_time_used = Duration::ZERO;
-        tracing::info!(target: "mini_harness::turn", turn_id = %turn, "queued turn started");
+        tracing::info!(target: "mini_harness::turn", turn_id = %turn, "turn started");
         Ok(())
     }
+
     pub async fn cancel_turn(&mut self, turn: TurnId) -> Result<(), HarnessError> {
         if self
             .state
@@ -510,8 +516,7 @@ where
             }
             if calls.len() > self.config.max_batch_tool_calls {
                 // Fail before appending any per-call events so an oversized
-                // batch cannot grow per-turn state (executions, inputs)
-                // without bound.
+                // batch cannot grow per-turn state without bound.
                 let error = ProviderError::from(format!(
                     "tool call batch of {} exceeds the {} call limit",
                     calls.len(),
@@ -557,362 +562,382 @@ where
                     .await;
                 return Err(error);
             }
-            let deferred_calls = calls.clone();
-            for (call_index, call) in calls.into_iter().enumerate() {
-                let call_id = call.call_id;
-                let call_name = call.name.clone();
-                let call_input = call.input.clone();
-                if let Err(error) = self
-                    .append(
+            for call in calls.into_iter() {
+                self.execute_tool_call(turn, call, &cancel, cancellation_reason)
+                    .await?;
+            }
+        }
+    }
+
+    /// 执行单个工具调用（含策略检查与审批暂停）。
+    ///
+    /// 事件序列：
+    /// 1. `tool.requested { requires_approval }` —— 总是首先追加；
+    ///    `requires_approval: true` 即客户端可见的"审批请求"。
+    /// 2. 若策略为 Ask → 返回 [`HarnessError::ApprovalPending`]，turn
+    ///    保持活跃；用户决定后由 [`AgentLoop::approve_tool`] 记录
+    ///    `tool.approval.responded` 并继续执行。
+    /// 3. 执行 → `tool.completed { outcome, duration_ms }`。
+    async fn execute_tool_call(
+        &mut self,
+        turn: TurnId,
+        call: crate::model::ToolCall,
+        cancel: &CancellationToken,
+        cancellation_reason: CancellationReason,
+    ) -> Result<(), HarnessError> {
+        let call_id = call.call_id;
+        let call_name = call.name.clone();
+        let call_input = call.input.clone();
+        // 先解析工具与校验输入: 失败不终止 turn，把错误作为工具结果
+        // 返回给模型，让它有机会在下一步纠正参数。
+        let resolved = match self.tools.lookup(&call_name.0) {
+            Ok(tool) => {
+                if let Err(error) = tool.validate_input(&call_input) {
+                    let outcome = ToolOutcome::Rejected {
+                        error: error.into(),
+                    };
+                    self.append(
                         Some(turn),
                         EventPayload::ToolRequested {
                             call_id,
                             name: call_name.clone(),
-                            input: call.input.clone(),
-                        },
-                    )
-                    .await
-                {
-                    let _ = self
-                        .append(
-                            Some(turn),
-                            EventPayload::TurnFailed {
-                                error: error.to_string(),
-                            },
-                        )
-                        .await;
-                    return Err(error);
-                }
-
-                let tool = match self.tools.lookup(&call_name.0) {
-                    Ok(tool) => tool,
-                    Err(error) => {
-                        self.append(
-                            Some(turn),
-                            EventPayload::ToolFailed {
-                                call_id,
-                                error: error.to_string().into(),
-                            },
-                        )
-                        .await?;
-                        // No tool ran. Return the durable failure to the model
-                        // so it can select an available tool on the next step.
-                        continue;
-                    }
-                };
-                if let Err(error) = tool.validate_input(&call_input) {
-                    self.append(
-                        Some(turn),
-                        EventPayload::ToolFailed {
-                            call_id,
-                            error: error.into(),
+                            input: call_input.clone(),
+                            requires_approval: false,
                         },
                     )
                     .await?;
-                    // Validation is side-effect free. Keep the turn alive to
-                    // allow corrected arguments, subject to the same turn
-                    // limits and policy checks as every other call.
-                    continue;
+                    return self
+                        .append_tool_completed(turn, call_id, &outcome, Duration::ZERO)
+                        .await;
                 }
-                let workspace = self.executor.workspace_root();
-                match self
-                    .policy
-                    .decide(&tool.spec(), &call.input, workspace.as_ref())
-                {
-                    PolicyDecision::Allow => {}
-                    PolicyDecision::Ask => {
-                        self.append(Some(turn), EventPayload::ToolApprovalRequested { call_id })
-                            .await?;
-                        let deferred = deferred_calls
-                            .iter()
-                            .skip(call_index.saturating_add(1))
-                            .map(|candidate| candidate.call_id)
-                            .collect::<Vec<_>>();
-                        if !deferred.is_empty() {
-                            self.append(
-                                Some(turn),
-                                EventPayload::ToolBatchDeferred {
-                                    call_ids: deferred,
-                                    reason: "tool batch paused for approval".into(),
-                                },
-                            )
-                            .await?;
-                        }
-                        return Err(HarnessError::ApprovalPending(
-                            format!("approval required for tool `{}`", call_name.0).into(),
-                        ));
-                    }
-                    PolicyDecision::Deny => {
-                        let reason = format!("policy denied tool `{}`", call_name.0);
-                        // Record the harness decision explicitly instead of
-                        // faking a user approval response: the durable log
-                        // must be able to answer "was the user ever asked?".
-                        self.append(
-                            Some(turn),
-                            EventPayload::ToolPolicyDenied {
-                                call_id,
-                                reason: reason.clone(),
-                            },
-                        )
-                        .await?;
-                        self.append(
-                            Some(turn),
-                            EventPayload::TurnFailed {
-                                error: reason.clone(),
-                            },
-                        )
-                        .await?;
-                        return Err(HarnessError::Policy(reason.into()));
-                    }
-                }
-
-                let execution_id = crate::runtime::ExecutionId::new();
+                tool
+            }
+            Err(error) => {
+                let outcome = ToolOutcome::Rejected {
+                    error: error.to_string().into(),
+                };
                 self.append(
                     Some(turn),
-                    EventPayload::ToolStarted {
+                    EventPayload::ToolRequested {
                         call_id,
-                        execution_id,
+                        name: call_name.clone(),
+                        input: call_input.clone(),
+                        requires_approval: false,
                     },
                 )
                 .await?;
-                tracing::info!(
-                    target: "mini_harness::tool",
-                    turn_id = %turn,
-                    call_id = %call_id,
-                    execution_id = %execution_id,
-                    tool = %call_name.0,
-                    "tool execution started"
-                );
-                let executor = Arc::clone(&self.executor);
-                let tool_cancel = cancel.clone();
-                let output_limit = self
-                    .config
-                    .max_tool_result_bytes
-                    .min(DEFAULT_TOOL_OUTPUT_LIMIT);
-                let tool_started_at = Instant::now();
-                let tool_deadline = bounded_tool_deadline(
-                    tool_started_at,
-                    turn_deadline,
-                    self.tool_time_used,
-                    self.config.max_tool_time,
-                );
-                let mut task = tokio::spawn(async move {
-                    tool.execute(
-                        call_input,
-                        ToolContext {
-                            executor: executor.as_ref(),
-                            cancel: tool_cancel,
-                            workspace,
-                            tool_call_id: call_id,
-                            execution_id,
-                            output_limit: crate::runtime::ByteLimit(output_limit),
-                        },
-                    )
-                    .await
-                });
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        if matches!(cancellation_reason, CancellationReason::Cancelled) {
-                            self.append(Some(turn), EventPayload::TurnCancelRequested)
-                                .await?;
+                return self
+                    .append_tool_completed(turn, call_id, &outcome, Duration::ZERO)
+                    .await;
+            }
+        };
+        let requires_approval = matches!(
+            self.policy.decide(&resolved.spec(), &call_input),
+            PolicyDecision::Ask
+        );
+        if let Err(error) = self
+            .append(
+                Some(turn),
+                EventPayload::ToolRequested {
+                    call_id,
+                    name: call_name.clone(),
+                    input: call_input.clone(),
+                    requires_approval,
+                },
+            )
+            .await
+        {
+            let _ = self
+                .append(
+                    Some(turn),
+                    EventPayload::TurnFailed {
+                        error: error.to_string(),
+                    },
+                )
+                .await;
+            return Err(error);
+        }
+        if requires_approval {
+            // turn 在此暂停（不追加任何终止事件）。审批决策本身就是
+            // durable 事实，由 approve_tool 记录。
+            return Err(HarnessError::ApprovalPending(
+                format!("approval required for tool `{}`", call_name.0).into(),
+            ));
+        }
+        self.run_approved_tool(
+            turn,
+            call_id,
+            call_input,
+            cancel.clone(),
+            cancellation_reason,
+        )
+        .await
+    }
+
+    /// 执行一个已通过审批（或无需审批）的工具调用并记录结果。
+    pub(super) async fn run_approved_tool(
+        &mut self,
+        turn: TurnId,
+        call_id: crate::runtime::ToolCallId,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+        cancellation_reason: CancellationReason,
+    ) -> Result<(), HarnessError> {
+        let turn_started_at = self.turn_started_at.unwrap_or_else(Instant::now);
+        let turn_deadline = turn_deadline_for(turn_started_at, self.config.max_turn_duration);
+        let tool_started_at = Instant::now();
+        let tool_deadline = bounded_tool_deadline(
+            tool_started_at,
+            turn_deadline,
+            self.tool_time_used,
+            self.config.max_tool_time,
+        );
+        let execution_id = crate::runtime::ExecutionId::new();
+        let tool_name = self
+            .state
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.tool_names.get(&call_id))
+            .cloned()
+            .unwrap_or_else(|| crate::runtime::ToolName(String::new()));
+        let tool = match self.tools.lookup(&tool_name.0) {
+            Ok(tool) => tool,
+            Err(error) => {
+                let outcome = ToolOutcome::Rejected {
+                    error: error.to_string().into(),
+                };
+                return self
+                    .append_tool_completed(turn, call_id, &outcome, Duration::ZERO)
+                    .await;
+            }
+        };
+        let workspace = self.executor.workspace_root();
+        tracing::info!(
+            target: "mini_harness::tool",
+            turn_id = %turn,
+            call_id = %call_id,
+            execution_id = %execution_id,
+            tool = %tool_name.0,
+            "tool execution started"
+        );
+        let executor = Arc::clone(&self.executor);
+        let tool_cancel = cancel.clone();
+        let output_limit = self
+            .config
+            .max_tool_result_bytes
+            .min(DEFAULT_TOOL_OUTPUT_LIMIT);
+        let mut task = tokio::spawn(async move {
+            tool.execute(
+                input,
+                ToolContext {
+                    executor: executor.as_ref(),
+                    cancel: tool_cancel,
+                    workspace,
+                    tool_call_id: call_id,
+                    execution_id,
+                    output_limit: crate::runtime::ByteLimit(output_limit),
+                },
+            )
+            .await
+        });
+        let result = tokio::select! {
+            _ = cancel.cancelled() => {
+                if matches!(cancellation_reason, CancellationReason::Cancelled) {
+                    self.append(Some(turn), EventPayload::TurnCancelRequested)
+                        .await?;
+                }
+                let outcome_unknown = match tokio::time::timeout(
+                    TOOL_CLEANUP_TIMEOUT,
+                    &mut task,
+                )
+                .await
+                {
+                    Ok(Ok(Ok(value))) => {
+                        if value.len() > self.config.max_tool_result_bytes {
+                            let outcome = ToolOutcome::Failed {
+                                error: format!(
+                                    "tool result exceeds the {} byte limit",
+                                    self.config.max_tool_result_bytes
+                                )
+                                .into(),
+                            };
+                            self.append_tool_completed(
+                                turn,
+                                call_id,
+                                &outcome,
+                                tool_started_at.elapsed(),
+                            )
+                            .await?;
+                        } else {
+                            let outcome = ToolOutcome::Succeeded {
+                                result: crate::runtime::ToolResult(value),
+                            };
+                            self.append_tool_completed(
+                                turn,
+                                call_id,
+                                &outcome,
+                                tool_started_at.elapsed(),
+                            )
+                            .await?;
                         }
-                        let outcome_unknown = match tokio::time::timeout(
-                            TOOL_CLEANUP_TIMEOUT,
-                            &mut task,
-                        )
-                        .await
-                        {
-                            Ok(Ok(Ok(value))) => {
-                                if value.len() > self.config.max_tool_result_bytes {
-                                    self.append(
-                                        Some(turn),
-                                        EventPayload::ToolFailed {
-                                            call_id,
-                                            error: format!(
-                                                "tool result exceeds the {} byte limit",
-                                                self.config.max_tool_result_bytes
-                                            )
-                                            .into(),
-                                        },
-                                    )
-                                    .await?;
-                                } else if let Err(error) = self
-                                    .append(
-                                        Some(turn),
-                                        EventPayload::ToolCompleted {
-                                            call_id,
-                                            result: crate::runtime::ToolResult(value),
-                                        },
-                                    )
-                                    .await
-                                {
-                                    self.append(
-                                        Some(turn),
-                                        EventPayload::ToolFailed {
-                                            call_id,
-                                            error: error.to_string().into(),
-                                        },
-                                    )
-                                    .await?;
-                                }
-                                false
-                            }
-                            Ok(Ok(Err(error))) => {
-                                self.append(
-                                    Some(turn),
-                                    EventPayload::ToolFailed {
-                                        call_id,
-                                        error: error.into(),
-                                    },
-                                )
-                                .await?;
-                                false
-                            }
-                            Ok(Err(join_error)) => {
-                                self.append(
-                                    Some(turn),
-                                    EventPayload::ToolOutcomeUnknown {
-                                        call_id,
-                                        reason: tool_join_error(join_error),
-                                    },
-                                )
-                                .await?;
-                                true
-                            }
-                            Err(_) => {
-                                task.abort();
-                                let _ = task.await;
-                                self.append(
-                                    Some(turn),
-                                    EventPayload::ToolOutcomeUnknown {
-                                        call_id,
-                                        reason: "tool cleanup timed out after cancellation".into(),
-                                    },
-                                )
-                                .await?;
-                                true
-                            }
-                        };
-                        self.record_tool_time(tool_started_at);
-                        if !outcome_unknown {
-                            self.append(Some(turn), cancellation_reason.event()).await?;
-                        }
-                        return Err(HarnessError::Cancelled);
+                        false
                     }
-                    _ = sleep_until(tool_deadline) => {
-                        task.abort();
-                        let _ = task.await;
-                        self.record_tool_time(tool_started_at);
+                    Ok(Ok(Err(error))) => {
+                        let outcome = ToolOutcome::Failed {
+                            error: error.into(),
+                        };
+                        self.append_tool_completed(
+                            turn,
+                            call_id,
+                            &outcome,
+                            tool_started_at.elapsed(),
+                        )
+                        .await?;
+                        false
+                    }
+                    Ok(Err(join_error)) => {
                         self.append(
                             Some(turn),
                             EventPayload::ToolOutcomeUnknown {
                                 call_id,
-                                reason: if tool_deadline < turn_deadline {
-                                    "cumulative tool time limit exceeded during tool execution"
-                                        .into()
-                                } else {
-                                    "turn wall-clock limit exceeded during tool execution".into()
-                                },
+                                reason: tool_join_error(join_error),
                             },
                         )
                         .await?;
-                        return Err(HarnessError::Timeout);
+                        true
                     }
-                    result = &mut task => match result {
-                        Ok(result) => result,
-                        Err(join_error) => Err(tool_join_error(join_error)),
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        self.append(
+                            Some(turn),
+                            EventPayload::ToolOutcomeUnknown {
+                                call_id,
+                                reason: "tool cleanup timed out after cancellation".into(),
+                            },
+                        )
+                        .await?;
+                        true
                     }
                 };
                 self.record_tool_time(tool_started_at);
-                match result {
-                    Ok(value) => {
-                        if value.len() > self.config.max_tool_result_bytes {
-                            let message = format!(
-                                "tool result exceeds the {} byte limit",
-                                self.config.max_tool_result_bytes
-                            );
-                            self.append(
-                                Some(turn),
-                                EventPayload::ToolFailed {
-                                    call_id,
-                                    error: message.clone().into(),
-                                },
-                            )
-                            .await?;
-                            self.append(
-                                Some(turn),
-                                EventPayload::TurnFailed {
-                                    error: message.clone(),
-                                },
-                            )
-                            .await?;
-                            return Err(HarnessError::Tool(message.into()));
-                        }
-                        let result_len = value.len();
-                        if let Err(error) = self
-                            .append(
-                                Some(turn),
-                                EventPayload::ToolCompleted {
-                                    call_id,
-                                    result: crate::runtime::ToolResult(value),
-                                },
-                            )
-                            .await
-                        {
-                            let message = error.to_string();
-                            let _ = self
-                                .append(
-                                    Some(turn),
-                                    EventPayload::ToolFailed {
-                                        call_id,
-                                        error: message.clone().into(),
-                                    },
-                                )
-                                .await;
-                            let _ = self
-                                .append(Some(turn), EventPayload::TurnFailed { error: message })
-                                .await;
-                            return Err(error);
-                        }
-                        tracing::info!(
-                            target: "mini_harness::tool",
-                            turn_id = %turn,
-                            call_id = %call_id,
-                            result_len,
-                            "tool execution completed"
-                        );
-                        if cancel.is_cancelled() {
-                            self.append_cancellation(turn, cancellation_reason).await?;
-                            return Err(HarnessError::Cancelled);
-                        }
-                    }
-                    Err(err) => {
-                        self.append(
-                            Some(turn),
-                            EventPayload::ToolFailed {
-                                call_id,
-                                error: err.clone().into(),
-                            },
-                        )
-                        .await?;
-                        tracing::warn!(
-                            target: "mini_harness::tool",
-                            turn_id = %turn,
-                            call_id = %call_id,
-                            error = %err,
-                            "tool execution failed"
-                        );
-                        if cancel.is_cancelled() {
-                            self.append_cancellation(turn, cancellation_reason).await?;
-                            return Err(HarnessError::Cancelled);
-                        }
-                        self.append(Some(turn), EventPayload::TurnFailed { error: err.clone() })
-                            .await?;
-                        return Err(HarnessError::Tool(err.into()));
-                    }
+                if !outcome_unknown {
+                    self.append(Some(turn), cancellation_reason.event()).await?;
                 }
+                return Err(HarnessError::Cancelled);
+            }
+            _ = sleep_until(tool_deadline) => {
+                task.abort();
+                let _ = task.await;
+                self.record_tool_time(tool_started_at);
+                self.append(
+                    Some(turn),
+                    EventPayload::ToolOutcomeUnknown {
+                        call_id,
+                        reason: if tool_deadline < turn_deadline {
+                            "cumulative tool time limit exceeded during tool execution".into()
+                        } else {
+                            "turn wall-clock limit exceeded during tool execution".into()
+                        },
+                    },
+                )
+                .await?;
+                return Err(HarnessError::Timeout);
+            }
+            result = &mut task => match result {
+                Ok(result) => result,
+                Err(join_error) => Err(tool_join_error(join_error)),
+            }
+        };
+        self.record_tool_time(tool_started_at);
+        match result {
+            Ok(value) => {
+                if value.len() > self.config.max_tool_result_bytes {
+                    let message = format!(
+                        "tool result exceeds the {} byte limit",
+                        self.config.max_tool_result_bytes
+                    );
+                    let outcome = ToolOutcome::Failed {
+                        error: message.clone().into(),
+                    };
+                    self.append_tool_completed(turn, call_id, &outcome, tool_started_at.elapsed())
+                        .await?;
+                    self.append(
+                        Some(turn),
+                        EventPayload::TurnFailed {
+                            error: message.clone(),
+                        },
+                    )
+                    .await?;
+                    return Err(HarnessError::Tool(message.into()));
+                }
+                let outcome = ToolOutcome::Succeeded {
+                    result: crate::runtime::ToolResult(value),
+                };
+                if let Err(error) = self
+                    .append_tool_completed(turn, call_id, &outcome, tool_started_at.elapsed())
+                    .await
+                {
+                    let message = error.to_string();
+                    let _ = self
+                        .append(Some(turn), EventPayload::TurnFailed { error: message })
+                        .await;
+                    return Err(error);
+                }
+                tracing::info!(
+                    target: "mini_harness::tool",
+                    turn_id = %turn,
+                    call_id = %call_id,
+                    "tool execution completed"
+                );
+                if cancel.is_cancelled() {
+                    self.append_cancellation(turn, cancellation_reason).await?;
+                    return Err(HarnessError::Cancelled);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let outcome = ToolOutcome::Failed {
+                    error: err.clone().into(),
+                };
+                self.append_tool_completed(turn, call_id, &outcome, tool_started_at.elapsed())
+                    .await?;
+                tracing::warn!(
+                    target: "mini_harness::tool",
+                    turn_id = %turn,
+                    call_id = %call_id,
+                    error = %err,
+                    "tool execution failed"
+                );
+                if cancel.is_cancelled() {
+                    self.append_cancellation(turn, cancellation_reason).await?;
+                    return Err(HarnessError::Cancelled);
+                }
+                self.append(Some(turn), EventPayload::TurnFailed { error: err.clone() })
+                    .await?;
+                Err(HarnessError::Tool(err.into()))
             }
         }
+    }
+
+    /// 追加 `tool.completed` 事件；失败时退化为 `tool.outcome_unknown`。
+    async fn append_tool_completed(
+        &mut self,
+        turn: TurnId,
+        call_id: crate::runtime::ToolCallId,
+        outcome: &ToolOutcome,
+        duration: Duration,
+    ) -> Result<(), HarnessError> {
+        let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.append(
+            Some(turn),
+            EventPayload::ToolCompleted {
+                call_id,
+                outcome: outcome.clone(),
+                duration_ms,
+            },
+        )
+        .await
     }
 }
 

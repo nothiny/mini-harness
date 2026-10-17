@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use mini_harness::{
     HarnessError,
-    durable::{EventPayload, EventStore, InMemoryEventStore, reduce},
+    durable::{EventPayload, EventStore, InMemoryEventStore, ToolOutcome, reduce},
     executor::LocalExecutor,
     model::{MockProvider, MockResponse, ToolCall},
     policy::{AllowAllPolicy, DefaultPolicy, ToolPolicy},
@@ -85,14 +85,33 @@ async fn malformed_and_unknown_calls_return_feedback_for_correction_and_replay()
         )));
     }
     let events = agent.store.read_from(EventSeq(1)).await.unwrap();
-    let started = events
+    // 只有真正执行的调用才会有成功的 tool.completed（malformed/unknown
+    // 被拒绝且未执行）。
+    let executed = events
         .iter()
-        .filter_map(|event| match event.payload {
-            EventPayload::ToolStarted { call_id, .. } => Some(call_id),
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolCompleted {
+                call_id,
+                outcome: ToolOutcome::Succeeded { .. },
+                ..
+            } => Some(*call_id),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(started, vec![corrected.call_id]);
+    assert_eq!(executed, vec![corrected.call_id]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::ToolCompleted {
+                    outcome: ToolOutcome::Rejected { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
     assert!(
         !events
             .iter()
@@ -155,14 +174,15 @@ async fn repeated_invalid_calls_stop_at_the_step_limit_without_execution() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event.payload, EventPayload::ToolFailed { .. }))
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::ToolCompleted {
+                    outcome: ToolOutcome::Rejected { .. },
+                    ..
+                }
+            ))
             .count(),
         2
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolStarted { .. }))
     );
     assert!(matches!(
         events.last().unwrap().payload,
@@ -190,13 +210,17 @@ async fn corrected_call_still_requires_policy_approval() {
     ));
     assert!(!directory.path().join("should-not-exist").exists());
     let events = agent.store.read_from(EventSeq(1)).await.unwrap();
+    // 审批请求 = requires_approval=true 的 tool.requested。
     assert!(events.iter().any(|event| matches!(
-        event.payload,
-        EventPayload::ToolApprovalRequested { call_id } if call_id == corrected.call_id
+        &event.payload,
+        EventPayload::ToolRequested { call_id, requires_approval: true, .. }
+            if *call_id == corrected.call_id
     )));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolStarted { .. }))
-    );
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolCompleted {
+            outcome: ToolOutcome::Succeeded { .. },
+            ..
+        }
+    )));
 }

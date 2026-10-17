@@ -11,23 +11,30 @@ use mini_harness::{
 };
 use tempfile::tempdir;
 
-/// A policy that denies every call, used to assert that a harness denial is
-/// distinguishable from a user approval response in the durable log.
-struct DenyAllPolicy;
+/// A policy that asks for every call, used to drive approval flows.
+struct AskAllPolicy;
 
-impl ToolPolicy for DenyAllPolicy {
+impl ToolPolicy for AskAllPolicy {
     fn decide(
         &self,
         _spec: &mini_harness::tools::ToolSpec,
         _input: &serde_json::Value,
-        _workspace: Option<&mini_harness::runtime::WorkspaceRoot>,
     ) -> PolicyDecision {
-        PolicyDecision::Deny
+        PolicyDecision::Ask
+    }
+}
+
+fn requires_approval(event: &mini_harness::durable::Event) -> Option<bool> {
+    match &event.payload {
+        EventPayload::ToolRequested {
+            requires_approval, ..
+        } => Some(*requires_approval),
+        _ => None,
     }
 }
 
 #[tokio::test]
-async fn default_policy_persists_approval_without_starting_execute_tool() {
+async fn default_policy_persists_approval_request_without_executing() {
     let directory = tempdir().unwrap();
     let marker = directory.path().join("should-not-exist");
     let provider = Arc::new(MockProvider::new(vec![MockResponse::ToolCall(ToolCall {
@@ -57,15 +64,16 @@ async fn default_policy_persists_approval_without_starting_execute_tool() {
         .read_from(mini_harness::runtime::EventSeq(1))
         .await
         .unwrap();
+    // 审批请求就是带 requires_approval=true 的 tool.requested 事件。
     assert!(
         events
             .iter()
-            .any(|event| { matches!(event.payload, EventPayload::ToolApprovalRequested { .. }) })
+            .any(|event| requires_approval(event) == Some(true))
     );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolStarted { .. }))
+            .any(|event| matches!(event.payload, EventPayload::ToolCompleted { .. }))
     );
     assert!(session.state().active_turn.is_some());
     let turn = session.state().active_turn.as_ref().unwrap().turn_id;
@@ -74,7 +82,7 @@ async fn default_policy_persists_approval_without_starting_execute_tool() {
 }
 
 #[tokio::test]
-async fn approval_pauses_and_records_the_rest_of_a_tool_batch() {
+async fn approval_pauses_before_the_rest_of_a_tool_batch() {
     let directory = tempdir().unwrap();
     tokio::fs::write(directory.path().join("note.txt"), "hello")
         .await
@@ -112,11 +120,18 @@ async fn approval_pauses_and_records_the_rest_of_a_tool_batch() {
         .read_from(mini_harness::runtime::EventSeq(1))
         .await
         .unwrap();
+    // 第一个调用请求了审批；批中后续调用尚未请求（恢复采样后由模型重新发起）。
     assert!(events.iter().any(|event| {
         matches!(
             &event.payload,
-            EventPayload::ToolBatchDeferred { call_ids, .. }
-                if call_ids == &vec![deferred]
+            EventPayload::ToolRequested { call_id, requires_approval: true, .. }
+                if *call_id == first
+        )
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EventPayload::ToolRequested { call_id, .. } if *call_id == deferred
         )
     }));
     session
@@ -212,13 +227,19 @@ async fn approval_executes_the_pending_tool_and_keeps_the_turn_budget() {
     }));
 }
 
+/// 简化版没有策略层 Deny：拒绝统一表示为「Ask + 用户拒绝」，
+/// 事件日志只记录一种拒绝事实（approved: false）。
 #[tokio::test]
-async fn policy_denial_is_recorded_without_a_fake_approval_response() {
+async fn user_denial_records_a_single_refusal_fact_and_cancels_the_turn() {
     let directory = tempdir().unwrap();
+    let marker = directory.path().join("denied-marker");
+    let call_id = ToolCallId::new();
     let provider = Arc::new(MockProvider::new(vec![MockResponse::ToolCall(ToolCall {
-        call_id: ToolCallId::new(),
+        call_id,
         name: ToolName("bash".into()),
-        input: serde_json::json!({"command": "echo nope"}),
+        input: serde_json::json!({
+            "command": format!("echo nope > '{}'", marker.to_string_lossy())
+        }),
     })]));
     let mut registry = ToolRegistry::default();
     registry.register(BashTool::default()).unwrap();
@@ -228,40 +249,42 @@ async fn policy_denial_is_recorded_without_a_fake_approval_response() {
         Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
         Arc::new(registry),
         store.clone(),
-        Arc::new(DenyAllPolicy),
+        Arc::new(AskAllPolicy),
     );
 
     assert!(matches!(
         session.start_turn("denied".into()).await,
-        Err(mini_harness::HarnessError::Policy(_))
+        Err(mini_harness::HarnessError::ApprovalPending(_))
     ));
+    let turn = session.state().active_turn.as_ref().unwrap().turn_id;
+    let error = session
+        .approve_tool(turn, call_id, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, mini_harness::HarnessError::Policy(_)));
+    assert!(!marker.exists());
+    assert!(session.state().active_turn.is_none());
     let events = store
         .read_from(mini_harness::runtime::EventSeq(1))
         .await
         .unwrap();
-    // The harness decision is explicit and no approval was ever requested
-    // or answered on its behalf.
-    assert!(events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::ToolPolicyDenied { reason, .. }
-            if reason.contains("policy denied tool")
-    )));
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EventPayload::ToolApprovalResponded { call_id: event_call_id, approved: false }
+                if *event_call_id == call_id
+        )
+    }));
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolApprovalRequested { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolApprovalResponded { .. }))
+            .any(|event| matches!(event.payload, EventPayload::ToolCompleted { .. }))
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.payload, EventPayload::TurnFailed { .. }))
+            .any(|event| matches!(event.payload, EventPayload::TurnCancelled))
     );
-    assert!(session.state().active_turn.is_none());
 }
 
 #[tokio::test]

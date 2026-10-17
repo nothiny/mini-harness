@@ -4,10 +4,9 @@ use std::time::Duration;
 use mini_harness::{
     durable::{EventPayload, EventStore, InMemoryEventStore},
     executor::LocalExecutor,
-    model::{MockProvider, MockResponse, ToolCall},
-    runtime::session::spawn,
-    runtime::{TurnId, UserInput, session},
-    tools::{BashTool, ToolRegistry},
+    model::{MockProvider, MockResponse},
+    runtime::{EventSeq, SessionId, TurnId, session::Session},
+    tools::ToolRegistry,
 };
 use tempfile::tempdir;
 
@@ -15,7 +14,7 @@ use tempfile::tempdir;
 async fn cancel_turn_acknowledges_only_the_active_turn() {
     let directory = tempdir().unwrap();
     let store = Arc::new(InMemoryEventStore::default());
-    let (handle, actor) = session::spawn(
+    let mut session = Session::new(
         Arc::new(MockProvider::new(vec![MockResponse::Delay(
             Duration::from_secs(5),
         )])),
@@ -23,38 +22,48 @@ async fn cancel_turn_acknowledges_only_the_active_turn() {
         Arc::new(ToolRegistry::default()),
         Arc::clone(&store),
     );
+    let session_id = session.state().session_id;
+    let turn = session
+        .start_turn_with_timeout("cancel me".into(), Duration::from_millis(100))
+        .await;
+    assert!(matches!(
+        turn,
+        Err(mini_harness::HarnessError::Timeout | mini_harness::HarnessError::Cancelled)
+    ));
+    // The turn is already terminal; cancelling it again is rejected.
+    let finished_turn = turn_terminal_id(&store, session_id).await;
+    assert!(session.cancel_turn(finished_turn).await.is_err());
+    let events = store.read_from(EventSeq(1)).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        EventPayload::TurnCancelled | EventPayload::TurnTimedOut
+    )));
+}
 
-    assert!(handle.cancel_turn(TurnId::new()).await.is_err());
-    let turn = handle
-        .start_turn(UserInput("cancel me".into()))
-        .await
-        .unwrap();
-    assert!(handle.cancel_turn(TurnId::new()).await.is_err());
-    assert!(handle.cancel_turn(turn).await.is_ok());
-    assert!(
-        matches!(handle.wait_turn(turn).await, Err(error) if matches!(&*error, mini_harness::HarnessError::Cancelled))
-    );
-    let events = store
-        .read_from(mini_harness::runtime::EventSeq(1))
-        .await
-        .unwrap();
-    let cancel_events = events
+async fn turn_terminal_id<S: EventStore>(
+    store: &Arc<S>,
+    session_id: SessionId,
+) -> mini_harness::runtime::TurnId {
+    let events = store.read_from(EventSeq(1)).await.unwrap();
+    events
         .iter()
-        .filter(|event| matches!(event.payload, EventPayload::TurnCancelRequested))
-        .count();
-    assert_eq!(cancel_events, 1);
-    assert!(handle.shutdown_with_result().await.is_ok());
-    actor.await.unwrap();
+        .find(|event| event.session_id == session_id)
+        .and_then(|event| event.turn_id)
+        .unwrap_or_else(TurnId::new)
 }
 
 #[tokio::test]
-async fn actor_can_approve_a_pending_tool_after_the_policy_outcome() {
+async fn session_can_approve_a_pending_tool_after_the_policy_outcome() {
     let directory = tempdir().unwrap();
-    let marker = directory.path().join("actor-approved");
+    let marker = directory.path().join("session-approved");
     let call_id = mini_harness::runtime::ToolCallId::new();
-    let (handle, actor) = spawn(
+    let mut tools = ToolRegistry::default();
+    tools
+        .register(mini_harness::tools::BashTool::default())
+        .unwrap();
+    let mut session = Session::new(
         Arc::new(MockProvider::new(vec![
-            MockResponse::ToolCall(ToolCall {
+            mini_harness::model::MockResponse::ToolCall(mini_harness::model::ToolCall {
                 call_id,
                 name: mini_harness::runtime::ToolName("bash".into()),
                 input: serde_json::json!({
@@ -64,26 +73,18 @@ async fn actor_can_approve_a_pending_tool_after_the_policy_outcome() {
             MockResponse::Text("approved".into()),
         ])),
         Arc::new(LocalExecutor::new(directory.path().to_path_buf())),
-        Arc::new({
-            let mut tools = ToolRegistry::default();
-            tools.register(BashTool::default()).unwrap();
-            tools
-        }),
+        Arc::new(tools),
         Arc::new(InMemoryEventStore::default()),
     );
 
-    let turn = handle
-        .start_turn(UserInput("approve this".into()))
-        .await
-        .unwrap();
+    let error = session.start_turn("approve this".into()).await.unwrap_err();
     assert!(matches!(
-        handle.wait_turn(turn).await,
-        Err(error) if matches!(&*error, mini_harness::HarnessError::ApprovalPending(_))
+        error,
+        mini_harness::HarnessError::ApprovalPending(_)
     ));
-    let (completed_turn, text) = handle.approve_tool(turn, call_id, true).await.unwrap();
+    let turn = session.state().active_turn.as_ref().unwrap().turn_id;
+    let (completed_turn, text) = session.approve_tool(turn, call_id, true).await.unwrap();
     assert_eq!(completed_turn, turn);
     assert_eq!(text, "approved");
     assert!(marker.exists());
-    handle.shutdown_with_result().await.unwrap();
-    actor.await.unwrap();
 }

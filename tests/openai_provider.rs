@@ -718,7 +718,7 @@ async fn deepseek_replays_reasoning_and_error_after_rejected_tool_input() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event.payload, EventPayload::ToolApprovalRequested { .. }))
+            .any(|event| matches!(event.payload, EventPayload::ToolApprovalResponded { .. }))
     );
 
     server.await.unwrap();

@@ -26,18 +26,6 @@ impl Timeout {
     }
 }
 
-/// Describes the safe default action for a fact that was interrupted during recovery.
-///
-/// The policy is intentionally separate from the execution result: an unknown result
-/// means that the external operation may have happened, while this value tells the
-/// caller what must be done before continuing the turn.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RecoveryPolicy {
-    RetryRead,
-    InspectEditHash,
-    RequireUserDecision,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct EventSeq(pub u64);
 impl fmt::Display for EventSeq {
@@ -46,18 +34,15 @@ impl fmt::Display for EventSeq {
     }
 }
 
+/// 一次工具调用在 reducer 状态机中的位置。
+///
+/// `ToolRequested` 事件创建 `Pending`；`ToolCompleted` 事件将其推进到
+/// `Completed` 或 `Failed`。被中断且结果不可知的调用停留在
+/// `OutcomeUnknown` —— 它们阻止 turn 正常完成。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExecutionState {
     Pending,
-    Running {
-        execution_id: super::ids::ExecutionId,
-    },
-    Completed {
-        result: ToolResult,
-    },
-    Failed {
-        error: ExecutionError,
-    },
-    Cancelled,
+    Completed { result: ToolResult },
+    Failed { error: ExecutionError },
     OutcomeUnknown,
 }

@@ -379,6 +379,32 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
+/// 进程组级取消: 清理整个进程树。
+///
+/// # 问题
+///
+/// 直接 `kill(pid)` 只能杀死父进程，子进程会变成孤儿进程:
+///
+/// ```text
+/// bash (pid=100)
+///   └─ sleep 1000 (pid=101)  ← kill(100) 后变成孤儿
+/// ```
+///
+/// # 解决方案
+///
+/// 创建新进程组，使用 `kill(-pgid, SIGKILL)` 杀死整组:
+///
+/// ```text
+/// bash (pid=100, pgid=100)
+///   └─ sleep 1000 (pid=101, pgid=100)
+///
+/// kill(-100, SIGKILL) → 两个进程都被杀死
+/// ```
+///
+/// # 跨平台差异
+///
+/// - Unix: `kill(-pid, SIGKILL)`
+/// - Windows: `taskkill /T /F /PID <pid>`
 fn configure_process_group(command: &mut Command) {
     #[cfg(unix)]
     {

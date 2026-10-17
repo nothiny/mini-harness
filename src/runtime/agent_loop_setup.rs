@@ -1,6 +1,6 @@
 use super::agent_loop::{AgentLoop, AgentLoopConfig};
 use crate::{
-    durable::{EventStore, create_checkpoint, reduce, replay_with_checkpoint_fallback},
+    durable::{EventStore, reduce},
     error::HarnessError,
     executor::Executor,
     model::ModelProvider,
@@ -8,8 +8,8 @@ use crate::{
     runtime::{EventSeq, SessionId, SessionState},
     tools::ToolRegistry,
 };
-use std::{path::Path, sync::Arc};
-use tokio::time::Instant;
+use std::sync::Arc;
+use tokio::time::Instant as TokioInstant;
 
 impl<P, E, S> AgentLoop<P, E, S>
 where
@@ -93,7 +93,7 @@ where
         // deadline is measured from the restart, not from the original input.
         // `turn_steps` and `tool_time_used` are also reset, so only durable
         // facts, not budgets, survive a restart.
-        let turn_started_at = state.active_turn.as_ref().map(|_| Instant::now());
+        let turn_started_at = state.active_turn.as_ref().map(|_| TokioInstant::now());
         Self {
             provider,
             executor,
@@ -109,7 +109,12 @@ where
         }
     }
 
-    /// Reconstructs a loop from the event store without executing any work.
+    /// 崩溃恢复 = 从事件日志完整重放（简化版没有 checkpoint）。
+    ///
+    /// 每个事件按序号交给 reducer；任何非法转换都会让恢复失败 ——
+    /// 宁可失败也不猜测历史。如果日志末尾有一个仍在运行的 turn
+    /// （崩溃前未写入终止事件），它保持 active 状态：调用方可以
+    /// `cancel_turn` 放弃它，或对挂起的审批做出决定。
     pub async fn restore(
         provider: Arc<P>,
         executor: Arc<E>,
@@ -146,57 +151,6 @@ where
         ))
     }
 
-    /// Reconstructs a loop using a durable checkpoint when it is available.
-    ///
-    /// Checkpoints are an optimization over the event log, so a missing,
-    /// corrupt, or stale snapshot transparently falls back to a full replay.
-    /// The resulting state is still validated against the event store's final
-    /// sequence before the loop is returned.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn restore_with_checkpoint(
-        provider: Arc<P>,
-        executor: Arc<E>,
-        tools: Arc<ToolRegistry>,
-        store: Arc<S>,
-        session_id: SessionId,
-        checkpoint_path: impl AsRef<Path>,
-        policy: Arc<dyn ToolPolicy>,
-        config: AgentLoopConfig,
-    ) -> Result<Self, HarnessError> {
-        let checkpoint_path = checkpoint_path.as_ref();
-        let state = replay_with_checkpoint_fallback(checkpoint_path, store.as_ref())
-            .await
-            .map_err(HarnessError::from)?;
-        if state.session_id != session_id {
-            return Err(HarnessError::InvariantViolation(format!(
-                "event store belongs to session {}, requested {}",
-                state.session_id, session_id
-            )));
-        }
-        let last_seq = store.last_seq().await?;
-        if state.last_seq != last_seq {
-            return Err(HarnessError::InvariantViolation(
-                "event store changed while restoring session".into(),
-            ));
-        }
-        // A successful resume is also the safe point to upgrade a legacy
-        // snapshot.  Write the replayed state, rather than the possibly stale
-        // v1 contents, so the migrated checkpoint covers the same log prefix
-        // that was validated above.  A missing or corrupt checkpoint is
-        // intentionally left alone; full replay remains the fallback.
-        if let Ok(checkpoint) = crate::durable::Checkpoint::read(checkpoint_path).await
-            && checkpoint.schema_version != crate::durable::Checkpoint::CURRENT_SCHEMA_VERSION
-        {
-            crate::durable::Checkpoint::from_state(&state)
-                .write_atomic(checkpoint_path)
-                .await
-                .map_err(HarnessError::from)?;
-        }
-        Ok(Self::from_state(
-            provider, executor, tools, store, state, policy, config,
-        ))
-    }
-
     pub async fn restore_default(
         provider: Arc<P>,
         executor: Arc<E>,
@@ -218,18 +172,5 @@ where
 
     pub fn set_system_instructions(&mut self, instructions: impl Into<String>) {
         self.system_instructions = Some(instructions.into());
-    }
-
-    /// Persists the current reducer state and advances it through the durable
-    /// checkpoint marker that was appended to the event log.
-    pub async fn create_checkpoint(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<crate::durable::Checkpoint, HarnessError> {
-        let checkpoint = create_checkpoint(self.store.as_ref(), &self.state, path)
-            .await
-            .map_err(HarnessError::from)?;
-        self.state = checkpoint.state.clone();
-        Ok(checkpoint)
     }
 }
