@@ -69,7 +69,7 @@ cargo run -- cancel <session-id> <turn-id>    # 取消 turn
 
 # 查看命令
 cargo run -- events <session-id>              # 查看事件日志
-cargo run -- inspect <session-id>             # 重放并查看状态
+cargo run -- inspect <session-id> [--until <seq>]  # 重放查看状态；--until 重放到任意历史时刻
 cargo run -- sessions                         # 列出所有会话
 
 # 工具命令
@@ -147,7 +147,7 @@ cargo run -p mini-harness-benchmark -- tasks/tasks.example.toml --provider deeps
 事件溯源做法：所有变化都是事件
 - ✅ 崩溃后重放事件即可恢复
 - ✅ 完整的决策历史
-- ✅ 时间旅行调试
+- ✅ 时间旅行调试（`inspect --until <seq>` 只重放前 N 条事件）
 
 ### 为什么需要进程组？
 
@@ -156,8 +156,8 @@ cargo run -p mini-harness-benchmark -- tasks/tasks.example.toml --provider deeps
 - ❌ 无法清理孙进程
 
 进程组做法：`kill(-pgid)`
-- ✅ 一次性清理整个进程树
-- ✅ 防止僵尸进程
+- ✅ 一次性清理整个进程树，避免孤儿进程（子孙进程在父进程死后继续运行）
+- ✅ 每条路径都 `wait()` 回收子进程，不遗留僵尸进程（已退出但未被回收的进程）
 
 ### 为什么需要工具审批？
 
@@ -179,9 +179,9 @@ mini-harness 是**学习项目**，与生产级 Harness 的差异：
 | Checkpoint | ❌ 只有重放 | ✅ 增量快照 |
 | 并发模型 | 同步 Session | Actor/Channel 并发 |
 | OS 沙箱 | ❌ 只有路径检查 | ✅ Landlock/Seatbelt |
-| Context 管理 | 简单 sliding window | 智能压缩 + 摘要 |
+| Context 管理 | 字节预算截取：单条 16KB / 历史后缀 512KB / 请求 1MB | 智能压缩 + 摘要 |
 | 工具并行 | 串行执行 | 并行执行 |
-| Streaming | ❌ | ✅ |
+| Streaming | ⚠️ 能解析 SSE 响应（收完整体后聚合），不做逐 token 增量输出 | ✅ 逐 token 输出 |
 
 **学习建议**: 先理解 mini-harness 的核心概念，再研究生产系统的优化。
 

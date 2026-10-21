@@ -1,10 +1,9 @@
 # mini-harness 教程：从一次请求读懂 Agent Harness
 
-> **注意（架构简化）**: 本仓库 `main`/`feature/simplify` 分支已经过教学化简化
-> （见 `SIMPLIFICATION_GUIDE.md`）：删除了 checkpoint、session actor、
-> durable queue 与 scheduler，合并了工具事件。本教程部分章节描述的是
-> **简化前**的实现，对应源码请切到 `bak` 分支对照阅读；核心概念
-> （事件溯源、reducer、进程组、审批）在两个版本中完全一致。
+> **注意（架构简化）**: 本仓库已经过教学化简化（见 `SIMPLIFICATION_GUIDE.md`）：
+> 删除了 checkpoint、session actor、durable queue 与 scheduler，合并了工具
+> 事件。本教程已同步改写为**简化后**的实现；想看简化前的完整版源码可切到
+> `bak` 分支对照，核心概念（事件溯源、reducer、进程组、审批）两个版本一致。
 
 这是一份**对照源码学习**的教程。目标不是让你背下几个术语，而是让你能打开这个仓库，沿着一次真实请求走完代码，并解释每一个边界为什么存在。
 
@@ -64,13 +63,14 @@ Session / Turn ──▶ Provider（模型）──▶ Tool call（建议）
 | reducer | [src/durable/reducer.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/reducer.rs) | `reduce` 如何拒绝非法序列 |
 | 事件存储 | [src/durable/store.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/store.rs)、[src/durable/event_log.rs](https://github.com/nothiny/mini-harness/blob/master/src/durable/event_log.rs) | trait 与 JSONL 实现 |
 | 模型抽象 | [src/model/provider.rs](https://github.com/nothiny/mini-harness/blob/master/src/model/provider.rs) | `ModelRequest`、`ModelResponse`、`ModelProvider` |
-| 主循环 | [src/runtime/agent_loop.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop.rs) | `append`、`run_turn_with_cancel` |
-| 恢复和构造 | [src/runtime/agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop_setup.rs) | `restore`、`restore_with_checkpoint` |
-| actor | [src/runtime/session.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/session.rs)、[src/runtime/session_actor.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/session_actor.rs) | 命令如何串行化 |
+| 主循环 | [src/runtime/agent_loop.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop.rs) | `append`、`run_turn` |
+| 恢复和构造 | [src/runtime/agent_loop_setup.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/agent_loop_setup.rs) | `restore`（完整重放，无 checkpoint） |
+| Session 门面 | [src/runtime/session.rs](https://github.com/nothiny/mini-harness/blob/master/src/runtime/session.rs) | 同步单写者、`begin_turn`/`continue_turn` 拆分 |
 | 工具 | [src/tools/](https://github.com/nothiny/mini-harness/tree/master/src/tools/) | `Tool`、`ToolRegistry`、read/edit/bash |
 | 执行器 | [src/executor/](https://github.com/nothiny/mini-harness/tree/master/src/executor/) | 文件和进程的真实副作用 |
-| 协议 | [src/protocol/jsonl.rs](https://github.com/nothiny/mini-harness/blob/master/src/protocol/jsonl.rs) | 请求循环、事件通知、安全投影 |
-| UI | [src/ui/](https://github.com/nothiny/mini-harness/tree/master/src/ui/) | UI 如何只消费协议 |
+| 协议 | [mini-harness-server/src/jsonl.rs](https://github.com/nothiny/mini-harness/blob/master/mini-harness-server/src/jsonl.rs) | 请求循环、事件通知、安全投影 |
+| UI | [ui/](https://github.com/nothiny/mini-harness/tree/master/ui/) | Ink TUI 如何只消费协议 |
+| 教学示例 | [examples/](https://github.com/nothiny/mini-harness/tree/master/examples/) | 四个可运行的最小闭环 |
 | CLI 组装 | [src/main.rs](https://github.com/nothiny/mini-harness/blob/master/src/main.rs) | 各个模块怎样接起来 |
 
 ## 十分钟预览：先看一条真实链路
@@ -98,7 +98,6 @@ turn.started
 provider.continuation.updated
 model.response.recorded        # 模型先提出 read
 tool.requested
-tool.started
 tool.completed                  # 文件内容回到历史
 provider.continuation.updated
 model.response.recorded        # 模型最后说 read complete
@@ -122,15 +121,15 @@ cargo run -- demo read README.md --json
 | 第 0 章 | 先建立一张地图 | 模型、工具、权限和持久化分别是谁负责？ |
 | 第 1 章 | 先读懂类型和事件 | 为什么不同 ID 不能都用 `String`？ |
 | 第 2 章 | EventStore 和 reducer——日志怎样变成状态 | 重启后状态怎样从日志恢复？ |
-| 第 3 章 | MockProvider、Session 和 actor | 怎样不联网先验证主循环？ |
+| 第 3 章 | MockProvider 与 Session——不联网验证主循环 | 怎样不联网先验证主循环？ |
 | 第 4 章 | Tool、Policy 和 Executor——一次 read 怎样到达文件系统 | 参数检查、权限检查和真实读文件为什么分层？ |
 | 第 5 章 | AgentLoop——一轮 turn 怎样反复采样 | 工具结果怎样回到下一次模型请求？ |
 | 第 6 章 | 进程、取消和原子编辑 | 怎样避免进程泄漏、管道死锁和半个文件？ |
-| 第 7 章 | 崩溃恢复——系统怎样面对“不知道” | 为什么“失败”和“结果未知”不能混为一谈？ |
+| 第 7 章 | 崩溃恢复——重放、结果未知与刻意不做的事 | 为什么“失败”和“结果未知”不能混为一谈？ |
 | 第 8 章 | 真实 provider——Responses 与 Chat Completions | provider 换了，主循环为什么不用改？ |
 | 第 9 章 | CLI 和 JSONL 协议——把 runtime 放到进程边界外 | 为什么 stdout 只能输出协议？ |
-| 第 10 章 | 事件查看器和 Ink TUI——UI 只是事件投影 | UI 崩溃时，runtime 怎样继续工作？ |
-| 第 11 章 | Scheduler、durable 队列和全局并发 | 输入队列怎样做到可恢复？并发上限放在哪里？ |
+| 第 10 章 | Ink TUI——UI 只是事件投影 | UI 崩溃时，会话怎样继续工作？ |
+| 第 11 章 | 并发边界——单写者、输入槽与进程并发上限 | 删掉 actor 后靠什么保证正确？并发上限放在哪里？ |
 | 尾声 | 把这份 Harness 读成一个系统 | 怎样继续做 sandbox、PTY、MCP 或远程执行器？ |
 
 术语不确定时，查[术语表](glossary.md)。
@@ -158,7 +157,7 @@ cargo run -- demo read README.md --json
 rustc --version
 cargo test
 cargo test --test integration_agent_loop
-cargo test --test recovery_classify
+cargo test --test cross_process_cancel
 RUST_LOG=mini_harness=debug cargo run -- demo read README.md
 ```
 
@@ -172,7 +171,7 @@ RUST_LOG=mini_harness=debug cargo run -- demo read README.md
 
 ### 2. 看到 `Arc`，先问谁拥有写权限
 
-共享读取很常见；会话状态和事件追加只有 actor 能改。后面看到 `SessionCommand`，把它理解为“请求唯一写者替我做一次状态迁移”。
+共享读取很常见；会话状态和事件追加只有一个驱动者能做（`&mut Session`，借用检查器强制）。后面看到 `start_turn` / `approve_tool` 这样的方法，把它理解为“请求唯一写者替我做一次状态迁移”。
 
 ### 3. 看到 `Result`，先问错误由谁处理
 

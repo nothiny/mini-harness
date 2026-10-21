@@ -52,9 +52,10 @@ EventPayload
   └─ SessionCreated
   └─ UserInputRecorded
   └─ TurnStarted
-  └─ ToolRequested
-  └─ ToolStarted
-  └─ ToolCompleted
+  └─ ToolRequested（含 requires_approval）
+  └─ ToolApprovalResponded
+  └─ ToolCompleted（outcome: succeeded/rejected/failed）
+  └─ ToolOutcomeUnknown
   └─ TurnCompleted
   └─ ...
 
@@ -96,7 +97,6 @@ turn_started
 provider_continuation_updated
 model_response_recorded
 tool_requested
-tool_started
 tool_completed
 provider_continuation_updated
 model_response_recorded
@@ -109,15 +109,15 @@ turn_completed
 
 打开 src/error.rs。HarnessError 把错误按处理者分组：
 
-- Durable：事件日志或 checkpoint 有问题；
+- Durable：事件日志有问题；
 - Provider：模型服务或响应格式有问题；
 - Tool：工具参数或模型可见的工具错误；
 - Execution：文件、进程和操作系统错误；
-- Policy：策略拒绝；
-- ApprovalPending：等待用户决定；
+- Policy：用户拒绝了审批；
+- ApprovalPending：turn 暂停，等待用户决定；
 - Cancelled 和 Timeout：控制流；
 - InvariantViolation：代码认为不可能发生的状态；
-- QueueLimitExceeded：输入队列已满。
+- TurnAlreadyActive：turn 运行期间收到新输入。
 
 读到一个错误时，先问“谁能处理它”。模型可以看到工具输出形式的错误，用户可以批准或拒绝工具，runtime 必须停止处理损坏的日志。
 

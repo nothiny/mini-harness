@@ -63,7 +63,7 @@ execution_id
 output_limit
 ~~~
 
-工具拿不到 SessionState、EventStore 或 SessionHandle。它只能通过 executor 做被允许的系统操作，然后返回一个模型可读字符串。执行器仍然使用类型化错误；只有在 Tool 这一层，错误才被序列化成 JSON 字符串。
+工具拿不到 SessionState、EventStore 或 Session。它只能通过 executor 做被允许的系统操作，然后返回一个模型可读字符串。执行器仍然使用类型化错误；只有在 Tool 这一层，错误才被序列化成 JSON 字符串。
 
 ## ReadTool 具体做了什么
 
@@ -87,31 +87,31 @@ LocalExecutor 还会处理目录、不存在、权限、二进制和 workspace �
 
 ## Policy 是执行前的门
 
-打开 src/policy/mod.rs。DefaultPolicy 的决定依赖 ToolSpec 的风险等级和这次 input：
+打开 src/policy/mod.rs。DefaultPolicy 的决定只依赖 ToolSpec 的风险等级和这次 input：
 
 ~~~text
 Read
-  workspace 内 → Allow
-  workspace 外或没有 workspace → Deny
+  → Allow
 
 Write
-  workspace 内 → Ask
-  workspace 外 → Deny
+  → Ask
 
 Execute
   被识别为只读命令 → Allow
   其他命令 → Ask
 ~~~
 
-Allow、Ask、Deny 都只是决定，不是执行结果：
+只有 Allow 和 Ask 两种决定，没有单独的 Deny：
 
-- Allow：runtime 追加 tool.started，然后调用工具；
-- Ask：runtime 追加 tool.approval.requested，等待用户；
-- Deny：runtime 追加 tool.policy_denied，不启动工具。
+- Allow：runtime 追加 tool.requested（requires_approval = false），直接执行；
+- Ask：runtime 追加 tool.requested（requires_approval = true），turn 暂停，等用户通过 approval.respond 决定；
+- 拒绝统一表示为「Ask + 用户拒绝」：事件日志里只有 tool.approval.responded { approved: false } 一种拒绝事实，随后 turn 以 turn.cancelled 终止。
+
+workspace 边界不在策略层把关：read/edit 越界时由执行器返回 OutsideWorkspace 错误，记录为 tool.completed { outcome: failed } 并终止 turn。
 
 当前 DefaultPolicy 会识别一部分只读 shell 命令，例如 ls、cat、grep 和 pwd；遇到重定向、命令替换、串联等可能产生副作用的写法，会要求审批。
 
-Policy 应该 fail closed：缺少 workspace、缺少 path 或无法判断风险时，不能因为“看起来可能没事”就允许。
+Policy 应该 fail closed：认不出只读命令、缺少 command 字段或无法判断风险时，一律按需要审批处理，不能因为“看起来可能没事”就允许。
 
 ## workspace 边界要看两次
 
@@ -153,17 +153,17 @@ cargo test --test policy
 
 读 JSON 时注意：
 
-- ToolRequested 保存完整调用输入；
-- ToolStarted 才表示真的进入执行；
-- ToolCompleted 才表示 executor 返回了结果；
-- Policy 拒绝不会出现 ToolStarted。
+- ToolRequested 保存完整调用输入和 requires_approval 标记；
+- 需要审批的调用在 ToolApprovalResponded 出现前不会执行；
+- ToolCompleted 才表示执行有了确定结果，outcome 区分 succeeded / rejected / failed；
+- 参数校验失败直接得到 rejected 结果，turn 不终止，模型可以在下一步纠正。
 
-你可以把 path 改成 ../outside，或请求一个不存在文件，比较“策略拒绝”和“执行器报 NotFound”的差异。两者发生的时间和责任人不同。
+你可以把 path 改成 ../outside，或请求一个不存在的文件，比较“执行器报 OutsideWorkspace”和“执行器报 NotFound”的差异。它们都发生在执行器层，与策略层的审批决定无关。
 
 ## 思考题
 
 1. 为什么 ReadTool 不直接接收 LocalExecutor，而是接收 Executor trait？
-2. workspace 外的 read 为什么直接 Deny，而不是 Ask？
+2. workspace 边界为什么由执行器强制，而不是做成策略层的第三种决定？
 3. 一个 path 在词法上位于 workspace 内，但通过 symlink 指向外部，哪一层应该拒绝？
 4. Tool 返回字符串错误，为什么 Executor 仍然保留类型化错误？
 5. ToolRegistry 的 spec 大小上限保护的是哪一个资源？

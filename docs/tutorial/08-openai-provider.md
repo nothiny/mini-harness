@@ -111,7 +111,7 @@ provider 可能遇到网络抖动、408、429 或 5xx。当前实现会区分可
   → 记录失败并返回
 ~~~
 
-每次尝试都可以通过 ProviderObserver 记录 ProviderAttempt。Session actor 只有在 attempt 事件追加成功后才确认给 provider，保证“日志里看到的尝试”与 runtime 观察一致。
+每次尝试都可以通过 ProviderObserver 记录 ProviderAttempt。采样循环（src/runtime/sampling.rs）只有在 attempt 事件追加成功后才通过 channel 向 provider 发 ack，保证“日志里看到的尝试”与 runtime 观察一致。
 
 ## 取消从哪里进入
 

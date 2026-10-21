@@ -33,7 +33,7 @@ SessionState
   ├─ status
   ├─ active_turn
   ├─ history
-  ├─ pending_inputs
+  ├─ pending_input
   ├─ provider_continuation
   └─ last_seq
 ~~~
@@ -47,10 +47,10 @@ src/runtime/state.rs 中的 SessionState 有几个字段：
 | 字段 | 含义 |
 |---|---|
 | session_id | 这份状态属于哪个会话 |
-| status | Idle、Running、Failed 或 Closed |
+| status | Idle、Running 或 Failed |
 | active_turn | 当前是否有正在处理的 turn |
 | history | 给后续模型请求使用的对话历史 |
-| pending_inputs | turn 运行时排队的用户输入 |
+| pending_input | 已记录但尚未被 turn.started 消费的单条输入（一次只允许一个） |
 | provider_continuation | 下一次 provider 请求需要的续传信息 |
 | last_seq | 已应用到状态的最后一条事件序号 |
 
@@ -70,20 +70,20 @@ TurnState 再记录某一轮内部发生的事情：模型最近的响应、工�
 
 然后它按 EventPayload 分支处理。例如：
 
-- UserInputRecorded 把用户输入写进 history，并加入 pending_inputs；
-- TurnStarted 从 pending_inputs 取出一条，创建 active_turn；
-- ToolRequested 创建 Pending execution；
-- ToolStarted 把 Pending 变成 Running；
-- ToolCompleted 把 Running 变成 Completed，并把工具结果放进 history；
+- UserInputRecorded 把用户输入写进 history，并放入 pending_input（仅当没有活跃 turn 且槽为空）；
+- TurnStarted 消费 pending_input，创建 active_turn；
+- ToolRequested 创建 Pending execution，requires_approval 为 true 时同时登记 Pending 审批；
+- ToolApprovalResponded 把审批状态改为 Approved 或 Denied；
+- ToolCompleted 终结 execution（outcome 区分 succeeded / rejected / failed），并把结果放进 history；
 - TurnCompleted 关闭 active_turn；
 - TurnFailed、TurnCancelled 和 TurnTimedOut 结束当前 turn。
 
 这些分支同时验证状态迁移是否合法。因此以下事件顺序会被拒绝：
 
 ~~~text
-ToolCompleted 出现在 ToolStarted 之前
+ToolCompleted 出现在 ToolRequested 之前
 同一 call_id 被完成两次
-TurnCompleted 时仍有 Running 工具
+TurnCompleted 时仍有未终结的工具
 另一个 session 的事件混进来
 seq 从 41 跳到 43
 ~~~
@@ -165,7 +165,7 @@ src/runtime/agent_loop.rs 中的 append 是理解整个 runtime 的关键函数�
 ~~~bash
 cargo test jsonl_rejects_sequence_gaps_and_middle_corruption
 cargo test jsonl_rejects_partial_tail
-cargo test reducer_allows_recovery_input_after_failure_but_not_close
+cargo test reducer_rejects_input_while_a_turn_is_active
 cargo test --test property_replay
 ~~~
 
@@ -190,8 +190,8 @@ cargo test --test property_replay
 1. 如果 reducer 在处理 ToolCompleted 时读取当前文件内容，会破坏什么性质？
 2. 为什么 JsonlEventStore 不能在读取时自动丢掉末尾半行，却可以提供单独的 repair_partial_tail？
 3. 如果 append 已经把事件写入文件，但进程在 self.state = next_state 之前崩溃，重启时会发生什么？
-4. 为什么 SessionState 的 pending_inputs 要从事件推导，而不是只存在 actor 的 VecDeque 中？
-5. 你会把 checkpoint 当成事实，还是当成缓存？如果 checkpoint 损坏，正确的退路是什么？
+4. 为什么 SessionState 的 pending_input 要从事件推导，而不是只存在调用方的内存里？
+5. 简化版没有 checkpoint，崩溃后总是全量重放。这个取舍在什么日志规模下开始变得昂贵？加 checkpoint 时它必须满足什么校验？
 
-下一章：[MockProvider、Session 和 actor](03-mock-provider-and-session.md)。
+下一章：[MockProvider 与 Session——不联网验证主循环](03-mock-provider-and-session.md)。
 

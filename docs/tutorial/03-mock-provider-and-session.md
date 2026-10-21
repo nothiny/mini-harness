@@ -1,15 +1,10 @@
-# 第 3 章：MockProvider、Session 和 actor
+# 第 3 章：MockProvider 与 Session——不联网验证主循环
 
 这一章把前两章的类型和事件放进一次真实 turn。重点不是模型回答得多聪明，而是看 runtime 怎样在没有网络的情况下验证自己的语义。
 
-当前项目有两种使用 Session 的方式：
-
-- 直接使用 Session：适合测试、CLI 和库调用；
-- 使用 SessionHandle：背后启动 session actor，适合协议、TUI 和需要中途取消的调用方。
-
 ## 先看 Provider trait
 
-打开 src/model/provider.rs。最重要的类型是：
+打开 `src/model/provider.rs`。最重要的类型是：
 
 ~~~text
 ModelRequest
@@ -26,7 +21,7 @@ ModelResponse
   └─ TextWithToolCalls
 
 ModelProvider
-  └─ complete(request, cancel) -> ModelResponse
+  └─ complete(request, cancel, observer) -> ModelCompletion
 ~~~
 
 Provider 只负责把请求送给模型并把响应翻译成统一类型。它不应该：
@@ -42,7 +37,7 @@ ModelRequest 是拥有所有权的值。Provider 收到它之后，可以把它�
 
 ## MockProvider 为什么重要
 
-打开 src/model/mock.rs。MockProvider 通常包含两部分：
+打开 `src/model/mock.rs`。MockProvider 通常包含两部分：
 
 ~~~text
 script
@@ -74,9 +69,20 @@ requests 让我们能观察上下文是否正确：
 
 如果第二次请求没有工具结果，runtime 的闭环就没有完成。
 
-## 直接使用 Session 的路径
+## Session：AgentLoop 的同步门面
 
-打开 src/runtime/session.rs 中的 Session 和构造函数。直接使用 Session 的调用大致是：
+打开 `src/runtime/session.rs`。`Session` 只包着一个 `AgentLoop`，提供几组入口：
+
+~~~text
+new / new_with_policy            构造新会话
+resume / resume_with_policy      重放日志恢复会话（上一章的 restore）
+start_turn(input)                跑完一个 turn，返回 (turn_id, text)
+start_turn_with_timeout          带墙钟期限
+cancel_turn / approve_tool       审批暂停后的中途控制
+begin_turn / continue_turn       拆分接口：先拿 id，再驱动执行
+~~~
+
+直接使用 Session 的调用方式：
 
 ~~~text
 Session::new_with_policy(...)
@@ -87,30 +93,30 @@ Session::start_turn(input)
       └─ 返回 (TurnId, final_text)
 ~~~
 
-这种方式简单，适合单线程式的库调用。它的限制也很明确：start_turn 正在运行时，调用方没有另一个命令入口可以发送 cancel。
+这种方式适合 CLI 的 `run`、测试和示例代码：一条主线跑到底，没有并发。
 
-这就是为什么 CLI 中的简单 run 可以使用 Session，而 TUI、JSONL server 和跨进程操作通常使用 actor handle。
+## 单写者靠什么保证
 
-## actor 的路径
+`start_turn(&mut self, ...)` 拿的是独占借用。turn 结束前，调用方无法对同一个 `Session` 调用任何其他方法——不是靠运行时约定，是靠借用检查器。turn 未结束时再开 turn，得到 `HarnessError::TurnAlreadyActive`。
 
-SessionHandle 背后是一个 tokio task。调用方不直接碰 AgentLoop，而是发 SessionCommand：
+那 turn 运行**期间**需要干预怎么办（取消、审批）？三条路：
+
+- **审批暂停**：`ask` 工具让 `start_turn` 以 `ApprovalPending` 错误返回。future 已经结束，借用已释放，这时可以调 `approve_tool`（批准并继续）或 `cancel_turn`（放弃）；
+- **墙钟超时**：`start_turn_with_timeout`；
+- **跨进程取消**：`mini-harness cancel` 写终态事件，运行进程在下一次 append 时发现日志变化而停止。
+
+关键理解：暂停是**返回错误**，不是 future 挂起等输入。`ApprovalPending` 是一个普通的返回值，turn 的状态机停在"等待审批"这个持久化状态上，进程甚至可以崩溃——重启重放后状态不变。
+
+## begin_turn / continue_turn 为什么存在
+
+协议服务器（第 9 章）需要在 turn 开始的瞬间就回复客户端一个 turn_id，而不是等 turn 跑完。所以 Session 提供拆分接口：
 
 ~~~text
-调用方
-  │
-  ├─ mpsc::Sender<SessionCommand>
-  │
-  ▼
-session_actor::run_actor
-  │
-  ├─ 唯一持有 AgentLoop
-  ├─ 唯一追加事件
-  └─ oneshot::Sender 返回本次命令的结果
+begin_turn(input) -> TurnId       记录 user.input.recorded + turn.started，立即返回
+continue_turn(id, cancel)         驱动采样、工具、终态，直到 turn 结束
 ~~~
 
-当前 SessionCommand 包含 StartTurn、CancelTurn、ApproveTool、WaitTurn、Checkpoint、QueryState 和 Shutdown。
-
-mpsc 传命令，oneshot 回结果。mpsc 适合连续接收请求，oneshot 适合“一条命令对应一个回复”。
+服务器先 `begin_turn` 拿到 id 回复客户端，再 `tokio::spawn` 一个任务驱动 `continue_turn`。并发是调用方组合出来的，Session 核心保持单线程可推理——这是简化版删掉 session actor 后的替代设计（详见第 11 章）。
 
 ## 一个文本 turn 怎样走完
 
@@ -129,28 +135,7 @@ Session::start_turn
   → 返回文本
 ~~~
 
-错误路径同样要记录事实。例如 provider 失败时，不能只把 Err 返回给调用方；runtime 还要追加 turn.failed。否则日志会停在 Running，恢复系统无法知道这是一个已经结束的失败 turn，还是进程在执行中崩溃。
-
-## actor 为什么不是 Arc<Mutex<Session>>
-
-共享一个 Mutex 也能让代码运行，但它会把几个问题混在一起：
-
-- 谁可以在 await 期间持有锁；
-- 状态迁移和事件追加是否同时发生；
-- cancel 和 start 谁先修改状态；
-- 一个命令失败后，锁内状态是否已经改变。
-
-actor 的规则更直接：只有 actor 能修改 AgentLoop，其他组件只能发命令。逻辑上的原子性由命令顺序和 append 事务保证。
-
-当前 actor 在活跃 turn 期间会 select 命令通道：
-
-- CancelTurn 会触发 turn token；
-- WaitTurn 会保存 waiter；
-- StartTurn 会暂存，等 AgentLoop future 释放可变借用后再 durable 地排队；
-- Checkpoint 会延迟到安全点；
-- Shutdown 会取消并等待清理。
-
-“收到命令”和“马上修改 state”不是同一个时刻。这个区别是读 session_actor.rs 时最容易漏掉的地方。
+错误路径同样要记录事实。例如 provider 失败时，不能只把 Err 返回给调用方；runtime 还要追加 `turn.failed`。否则日志会停在 Running，恢复系统无法知道这是一个已经结束的失败 turn，还是进程在执行中崩溃。
 
 ## 读测试的方式
 
@@ -159,18 +144,18 @@ actor 的规则更直接：只有 actor 能修改 AgentLoop，其他组件只能
 ~~~bash
 cargo test mock_script_exhaustion_is_a_provider_error
 cargo test provider_error_records_turn_failed
-cargo test wait_turn_observes_provider_failure_after_start_ack
-cargo test session_actor
+cargo test --test integration_agent_loop
+cargo run --example 02_agent_loop
 ~~~
 
-读 actor 测试时，画两条时间线：
+`examples/02_agent_loop.rs` 用三十行代码把"构造组件 → start_turn → 打印事件"走了一遍，是本章最好的浓缩版。读测试时，画两条时间线：
 
 ~~~text
-StartTurn 的 ack 什么时候返回
-WaitTurn 的结果什么时候返回
+start_turn 的返回什么时候发生
+turn 的终止事件什么时候落盘
 ~~~
 
-这两个时间点不一定相同。StartTurn 说明请求已经被接受，WaitTurn 说明 turn 已经有最终结果。
+文本 turn 两者几乎同时；带审批的 turn 中间隔着一个用户决定。这个间隔就是"暂停 = 返回错误"设计的直观体现。
 
 ## 这一章读完后
 
@@ -178,17 +163,16 @@ WaitTurn 的结果什么时候返回
 
 - MockProvider 为什么不只是测试替身；
 - ModelRequest 为什么必须是拥有所有权的快照；
-- Session 和 SessionHandle 的使用场景差异；
-- actor 如何保证只有一个写者；
-- provider 错误为什么也要留下 turn.failed。
+- 单写者怎样由借用检查器而不是 actor 保证；
+- 审批暂停为什么是返回错误而不是挂起等待；
+- begin_turn / continue_turn 的拆分为谁服务。
 
 ## 思考题
 
-1. 如果 Provider trait 接收的是 &mut SessionState，会出现哪两种边界混乱？
-2. 为什么 StartTurn 和 WaitTurn 要分开？把它们合成一个阻塞调用会让哪个客户端难以实现？
-3. actor 在执行模型请求时仍然需要接收 CancelTurn。取消信号经过哪些对象到达 provider？
+1. 如果 Provider trait 接收的是 `&mut SessionState`，会出现哪两种边界混乱？
+2. 为什么不做一个 `wait_for_approval()` 让 future 挂起等用户？对比"返回错误 + 状态机暂停"的恢复语义。
+3. 同一个 Session 被 `Arc<Mutex<>>` 包住后跨 task 共享，和 actor 模型差在哪？哪种问题会被推迟到运行期？
 4. 如果 MockProvider 的 script 耗尽后 panic，为什么会让恢复语义变差？
-5. 直接使用 Session 的测试很方便。你会在什么条件下把它改成 SessionHandle？
+5. `resume` 之后立刻 `start_turn`，如果崩溃前的 turn 还没终止，会发生什么？应该先做什么？
 
 下一章：[Tool、Policy 和 Executor——一次 read 怎样到达文件系统](04-first-tool.md)。
-

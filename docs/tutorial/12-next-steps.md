@@ -4,7 +4,7 @@
 
 ~~~text
 用户输入
-  → Session / actor
+  → Session（单写者门面）
   → AgentLoop
   → Provider
   → ModelResponse
@@ -21,14 +21,13 @@
 
 ~~~text
 崩溃
-  → replay
-  → RecoveryFinding
-  → 人的决定
-  → 恢复事实
+  → 完整重放（无 checkpoint）
+  → 活跃 turn / 挂起审批浮出水面
+  → 人的决定（取消或批准）
 
 UI / CLI
-  → JSONL 协议
-  → SessionCommand
+  → mini-harness-server（JSONL 协议）
+  → begin_turn / continue_turn 拆分
   → 安全事件投影
 ~~~
 
@@ -38,15 +37,15 @@ UI / CLI
 
 ### 问题一：谁拥有写权限
 
-会话状态和事件追加只有 AgentLoop 所在的 actor 能修改。Provider、Tool、UI 和 Scheduler 都通过明确接口请求它们。
+同一个 Session 同一时刻只有一个驱动者（`&mut` 借用强制）。Provider、Tool 和 UI 都拿不到写权限；跨进程写入靠 append 前的 last_seq 校验拦截。
 
 ### 问题二：什么是事实
 
-用户输入、模型响应、工具请求、工具开始和完成、审批、取消、恢复和 checkpoint marker 都是事件。SessionState、run_state、UI 显示内容和 queue 的当前视图都是从事实推导出来的。
+用户输入、模型响应、工具请求和结果、审批决定、取消、超时和 provider attempt 都是事件。SessionState、UI 显示内容和 pending_input 槽都是从事实推导出来的。
 
 ### 问题三：哪里可能不知道
 
-工具或 provider 的外部副作用可能已经发生，但结果还没有进入日志。OutcomeUnknown 和 RecoveryFinding 让这个窗口显式存在，系统不会用“失败”假装知道结果。
+工具或 provider 的外部副作用可能已经发生，但结果还没有进入日志。OutcomeUnknown 让这个窗口显式存在，系统不会用“失败”假装知道结果。
 
 ### 问题四：哪个模块可以替换
 
@@ -59,27 +58,26 @@ Provider 可以换成新的 wire format；Executor 可以换成 sandbox 或远�
 1. src/main.rs 的 run_demo：组件怎样被接线；
 2. src/runtime/agent_loop.rs 的 append：一条事实怎样进入日志；
 3. src/durable/reducer.rs 的 reduce：日志怎样变成状态；
-4. src/runtime/session_actor.rs 的 run_actor：谁拥有唯一写权限；
-5. src/protocol/event_projection.rs 的 project_event：哪些事实能安全地给客户端；
-6. src/durable/recovery.rs 的 classify_state：崩溃后的状态如何分类。
+4. src/runtime/session.rs 与 agent_loop_setup.rs 的 restore：单写者门面与崩溃重放；
+5. mini-harness-server/src/projection.rs 的投影：哪些事实能安全地给客户端；
+6. mini-harness-server/src/jsonl.rs 的 turn.start：外层怎样组合出并发。
 
 再运行一次：
 
 ~~~bash
 cargo run -- demo read README.md --json
 cargo test --test integration_agent_loop
-cargo test --test recovery_classify
-cargo test --test scheduler
+cargo test --test cross_process_cancel
+cargo test --test property_replay
 ~~~
 
 这一次不要只看测试通过。把 demo 的每条事件放在下面这张表里：
 
 | 事件 | 它记录的事实 | reducer 改变的状态 | 下一步谁消费 |
 |---|---|---|---|
-| user.input.recorded | 用户说了什么 | history、pending_inputs | AgentLoop |
-| tool.requested | 模型要求哪个工具 | Pending execution | Policy / Tool |
-| tool.started | 工具真的开始 | Running execution | Executor |
-| tool.completed | 工具返回了什么 | Completed、history | Provider |
+| user.input.recorded | 用户说了什么 | history、pending_input | AgentLoop |
+| tool.requested | 模型要求哪个工具、是否需审批 | Pending execution（可带 Pending 审批） | Policy / Tool |
+| tool.completed | 工具结果或失败 | 终结 execution、history | Provider |
 | turn.completed | 最终回答是什么 | active_turn 清空 | Session / UI |
 
 如果某个事件无法回答“谁产生、谁消费、状态怎样变化”，就回到对应章节继续读。

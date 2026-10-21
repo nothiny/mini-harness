@@ -58,7 +58,6 @@ turn.started
 provider.continuation.updated
 model.response.recorded        模型提出 read
 tool.requested
-tool.started
 tool.completed                  文件内容回到历史
 provider.continuation.updated
 model.response.recorded        模型给出最终文本
@@ -87,7 +86,7 @@ turn.completed
 | Step | turn 中的一次模型请求和处理 |
 | Provider | 把模型服务翻译成 ModelRequest 和 ModelResponse |
 | Tool | 模型可以请求的操作，例如 read、edit、bash |
-| Policy | 决定工具调用是 Allow、Ask 还是 Deny |
+| Policy | 决定工具调用直接执行（Allow）还是先请求用户审批（Ask） |
 | Executor | 真正访问文件和进程的能力层 |
 | Event | 已经发生的事实 |
 | State | reducer 从事件推导出的当前视图 |
@@ -116,11 +115,17 @@ error
 executor
 model
 policy
-protocol
 runtime
-scheduler
 tools
-ui
+~~~
+
+协议服务器和 benchmark 是独立的 workspace crate，主库不依赖它们：
+
+~~~text
+mini-harness-server/     JSONL 协议服务器（--stdio）
+mini-harness-benchmark/  非交互评测 runner
+examples/                四个可运行的教学示例
+ui/                      Ink TUI（TypeScript 协议客户端）
 ~~~
 
 再按下面的角色理解每个目录：
@@ -131,9 +136,10 @@ src/main.rs
 
 src/runtime/
   ├─ agent_loop.rs       一次 turn 的主循环
-  ├─ agent_loop_setup.rs 构造和恢复 AgentLoop
-  ├─ session.rs          Session、SessionHandle、SessionCommand
-  ├─ session_actor.rs    单写者命令循环
+  ├─ agent_loop_setup.rs 构造和恢复 AgentLoop（重放）
+  ├─ agent_loop_approval.rs  审批决策与恢复执行
+  ├─ sampling.rs         采样循环与 provider attempt 事件
+  ├─ session.rs          Session 同步门面
   ├─ context.rs          给模型的有限快照
   └─ state.rs            SessionState 和派生生命周期
 
@@ -150,23 +156,16 @@ src/tools/
 
 src/executor/
   ├─ trait.rs            文件、进程、编辑的能力接口
-  ├─ local.rs            本地 executor
+  ├─ local.rs            本地 executor（含进程并发信号量）
   ├─ process.rs          进程组、排空、输出上限
   └─ filesystem.rs       路径和原子编辑
 
 src/durable/
   ├─ event.rs            Event 和 EventPayload
   ├─ reducer.rs          事件到状态
-  ├─ store.rs             EventStore trait
-  ├─ memory.rs            内存事件日志
-  ├─ event_log.rs         JSONL 事件日志
-  ├─ recovery.rs          崩溃分类
-  └─ checkpoint.rs        快照和重放
-
-src/protocol/
-  ├─ jsonl_transport.rs  有界 JSONL 传输
-  ├─ jsonl.rs             serve --stdio
-  └─ event_projection.rs  安全事件投影
+  ├─ store.rs            EventStore trait
+  ├─ memory.rs           内存事件日志
+  └─ event_log.rs        JSONL 事件日志
 ~~~
 
 目录不是学习顺序。学习顺序应该跟着一条数据流：
@@ -200,15 +199,15 @@ Executor 处理文件和进程等外部副作用。它有结构化错误、取�
 
 ### 持久化边界
 
-Event log 保存事实。SessionState 是 reducer 产物，checkpoint 是加速重放的缓存。
+Event log 保存事实。SessionState 是 reducer 产物；崩溃恢复就是从日志完整重放（简化版没有 checkpoint）。
 
 ### 并发边界
 
-每个 session 的状态和追加由一个 actor 负责。其他线程或进程通过命令和 durable store 参与。
+同一个 Session 同一时刻只有一个驱动者（借用检查器强制）；跨进程的并发通过共享事件日志协调，append 前校验日志未被别人写过。
 
 ### 客户端边界
 
-CLI、TUI 和 Ink UI 通过 JSONL 协议发命令和消费事件投影。它们不直接调用 provider 或 executor。
+CLI 直接调用库或读事件日志；TUI 和外部程序通过 mini-harness-server 的 JSONL 协议发命令、消费安全投影。它们不直接调用 provider 或 executor。
 
 ## 这一章的阅读动作
 

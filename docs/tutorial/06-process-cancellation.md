@@ -87,7 +87,7 @@ AgentLoop 给每个 turn 一个 CancellationToken，工具可以使用它，进�
 
 用户取消记录 turn.cancel_requested 和 turn.cancelled。时间预算耗尽记录 turn.timed_out。
 
-如果工具开始执行后，进程被杀或清理超时，runtime 可能无法知道外部副作用是否完成。这时记录 tool.outcome_unknown。它和 tool.failed 的差异是：
+如果工具开始执行后，进程被杀或清理超时，runtime 可能无法知道外部副作用是否完成。这时记录 tool.outcome_unknown。它和 tool.completed { outcome: failed } 的差异是：
 
 ~~~text
 Failed
@@ -97,7 +97,7 @@ OutcomeUnknown
   → 本地日志无法证明外部操作是否发生
 ~~~
 
-第 7 章会把这个状态交给恢复系统处理。
+第 7 章会把这个状态交给恢复流程解释。
 
 ## edit 为什么要 hash guard
 
@@ -152,4 +152,4 @@ cargo test cross_process_cancel
 6. 如果两个 harness 实例同时编辑一个文件，advisory lock 和 hash guard 各自解决什么问题？
 7. 输出上限、历史上限和事件大小上限分别保护哪个边界？
 
-下一章：[崩溃恢复——系统怎样面对“不知道”](07-recovery.md)。
+下一章：[崩溃恢复——重放、结果未知与刻意不做的事](07-recovery.md)。

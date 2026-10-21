@@ -12,10 +12,10 @@ use crate::{
 ///
 /// * 这里（8MB）: 累积审计历史的上限，防止一个会话快照无限增长；
 /// * `AgentLoopConfig::max_context_bytes`（1MB）: 单次模型请求的上限，
-///   作用在滑动窗口裁剪之后。
+///   作用在 ContextSnapshot 的字节预算截取之后。
 ///
-/// 若两者共用同一个限制，长会话的累积 history 会先触顶，导致滑动
-/// 窗口后本还很小的请求被误拒。
+/// 若两者共用同一个限制，长会话的累积 history 会先触顶，导致截取
+/// 后本还很小的请求被误拒。
 pub(crate) const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 
 fn push_history(state: &mut SessionState, item: HistoryItem) -> Result<(), HarnessError> {
@@ -75,7 +75,8 @@ fn reset_provider_cursor(state: &mut SessionState) {
 /// # 为什么需要确定性？
 ///
 /// 1. **崩溃恢复**: 进程崩溃后，从事件日志重放即可恢复到崩溃前状态
-/// 2. **时间旅行**: 可以重放到任意历史时刻，用于调试
+/// 2. **时间旅行**: 可以重放到任意历史时刻（`mini-harness inspect
+///    --until <seq>` 只重放前 N 条事件），用于调试
 /// 3. **一致性**: 多个进程读取同一事件日志，得到相同的状态视图
 ///
 /// # 如何保证确定性？

@@ -47,11 +47,12 @@ while turn 还没有终态:
         检查是否为空、是否重复、是否超过 batch 上限
         append model.response.recorded
         对每个 call:
-            append tool.requested
             通过 policy
-            Allow → append tool.started → 执行 → append tool.completed/failed
-            Ask → append tool.approval.requested，暂停
-            Deny → append tool.policy_denied，结束或继续
+            append tool.requested（带 requires_approval）
+            Allow → 执行 → append tool.completed
+            Ask → 暂停，等待 approval.respond
+                用户批准 → 执行 → append tool.completed
+                用户拒绝 → append tool.approval.responded + turn.cancelled
         回到下一轮采样
 ~~~
 
@@ -134,17 +135,15 @@ AgentLoop::append 的顺序必须牢记：
 工具的取消还要等 executor 收尾。审批则是另一种暂停：
 
 ~~~text
-tool.requested
-  → tool.approval.requested
-  → turn 保持 active
-  → 用户批准
-  → tool.approval.responded
-  → tool.started
-  → 工具完成
-  → 回到采样
+tool.requested（requires_approval = true）
+  → turn 保持 active，采样以 ApprovalPending 错误返回
+  → 用户决定
+  → tool.approval.responded { approved }
+  → 批准：执行 → tool.completed → 回到采样
+  → 拒绝：turn.cancelled，turn 终止
 ~~~
 
-审批不是 provider 错误。它是一个已经持久化的控制状态，所以 UI 或协议客户端重启后仍然可以看到“正在等待审批”。
+审批不是 provider 错误。它是一个已经持久化的控制状态：重启进程、重放日志，状态机仍然停在“等待审批”，调用方随后用 approve_tool 恢复或 cancel_turn 放弃。
 
 ## 建议的阅读实验
 
@@ -172,7 +171,7 @@ request 2: user history + tool result + tool specs
 3. 如果模型一次返回 100 个工具调用，最早应该在哪一层限制？
 4. append 的副本 reduce 能防止哪些问题，不能防止哪些外部副作用？
 5. 为什么 turn.cancel_requested 和 turn.cancelled 要分成两个事实？
-6. 审批暂停时，Session actor 为什么可以处理新输入；工具执行期间又为什么会延迟处理？
+6. 审批暂停用“返回 ApprovalPending 错误”而不是“future 挂起等用户”实现。这个选择让恢复语义变好了什么？
 
 下一章：[进程、取消和原子编辑](06-process-cancellation.md)。
 
