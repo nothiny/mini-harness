@@ -72,7 +72,9 @@ async fn run() -> Result<(), String> {
         }
         CliCommand::Cancel(args) => run_cli_cancel(&config, args).await,
         CliCommand::Events(args) => run_events(&config, &args.reference, args.format).await,
-        CliCommand::Inspect(args) => run_inspect(&config, &args.reference, args.format).await,
+        CliCommand::Inspect(args) => {
+            run_inspect(&config, &args.reference, args.format, args.until).await
+        }
         CliCommand::Sessions(args) => run_sessions(&config, args.format).await,
         CliCommand::Demo(args) => run_demo(args).await,
         CliCommand::Config(_) => run_config_show(&config).await,
@@ -99,7 +101,7 @@ enum CliCommand {
     Resume(ResumeArgs),
     Cancel(CancelArgs),
     Events(LogArgs),
-    Inspect(LogArgs),
+    Inspect(InspectArgs),
     Sessions(SessionsArgs),
     Demo(DemoArgs),
     Config(ConfigShowArgs),
@@ -213,6 +215,19 @@ struct ResumeArgs {
 struct LogArgs {
     /// Event-log path or a session id resolved against the durable layout.
     reference: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+}
+
+#[derive(Args)]
+struct InspectArgs {
+    /// Event-log path or a session id resolved against the durable layout.
+    reference: String,
+    /// Replay only the first `seq` events (inclusive) and print the state
+    /// at that point in time. Out-of-range values fail loudly instead of
+    /// silently replaying the whole log.
+    #[arg(long)]
+    until: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     format: OutputFormat,
 }
@@ -373,16 +388,35 @@ fn replay_state(
 }
 
 /// `mini-harness inspect`: 重放事件日志并打印会话状态。
+///
+/// `--until <seq>` 只重放前 `seq` 条事件（含第 seq 条）：确定性 reducer
+/// 让“重放到任意历史时刻”退化为前缀重放，这就是时间旅行调试。
 async fn run_inspect(
     config: &mini_harness::config::HarnessConfig,
     reference: &str,
     format: OutputFormat,
+    until: Option<u64>,
 ) -> Result<(), String> {
     let store = open_referenced_log(config, reference).await?;
     let events = store
         .read_from(EventSeq(1))
         .await
         .map_err(|error| error.to_string())?;
+    let events = match until {
+        Some(seq) => {
+            let last = events.last().map(|event| event.seq.0).unwrap_or(0);
+            if seq == 0 || seq > last {
+                return Err(format!(
+                    "--until {seq} is outside the event log (seq 1..={last})"
+                ));
+            }
+            events
+                .into_iter()
+                .take_while(|event| event.seq.0 <= seq)
+                .collect::<Vec<_>>()
+        }
+        None => events,
+    };
     let session_id = events
         .first()
         .map(|event| event.session_id)

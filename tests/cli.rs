@@ -138,6 +138,72 @@ fn cli_run_resume_and_cancel_expose_session_identity() {
 }
 
 #[test]
+fn inspect_until_replays_a_log_prefix() {
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("events.jsonl");
+    let run = Command::new(env!("CARGO_BIN_EXE_mini-harness"))
+        .args([
+            "run",
+            "hello",
+            "--event-log",
+            log.to_str().unwrap(),
+            "--workspace",
+            directory.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // seq 3 是 turn.started：只重放前三条时，turn 应处于 Running。
+    let prefix = Command::new(env!("CARGO_BIN_EXE_mini-harness"))
+        .args([
+            "inspect",
+            log.to_str().unwrap(),
+            "--until",
+            "3",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        prefix.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prefix.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&prefix.stdout).unwrap();
+    assert_eq!(value["last_seq"], 3, "prefix replay must stop at seq 3");
+    assert_eq!(value["status"], "Running");
+    assert!(value["active_turn"].is_object(), "turn 3 must be active");
+
+    // 不加 --until 则全量重放，turn 已终结。
+    let full = Command::new(env!("CARGO_BIN_EXE_mini-harness"))
+        .args(["inspect", log.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(full.status.success());
+    let full_value: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+    assert_eq!(full_value["status"], "Idle");
+    assert!(full_value["last_seq"].as_u64().unwrap() > 3);
+
+    // 越界的 --until 直接报错，而不是静默退化成全量重放。
+    let beyond = Command::new(env!("CARGO_BIN_EXE_mini-harness"))
+        .args(["inspect", log.to_str().unwrap(), "--until", "9999"])
+        .output()
+        .unwrap();
+    assert!(!beyond.status.success());
+    assert!(
+        String::from_utf8_lossy(&beyond.stderr).contains("outside the event log"),
+        "expected an out-of-range error, got: {}",
+        String::from_utf8_lossy(&beyond.stderr)
+    );
+}
+
+#[test]
 fn cli_requires_a_model_when_openai_provider_is_selected() {
     let directory = tempdir().unwrap();
     let log = directory.path().join("events.jsonl");
