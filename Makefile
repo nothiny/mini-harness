@@ -5,7 +5,10 @@ BINARY       := target/debug/mini-harness
 SERVER_BIN   := target/debug/mini-harness-server
 BENCH_BIN    := target/debug/mini-harness-benchmark
 UI_DIR       := ui
+UI_MODULES   := $(UI_DIR)/node_modules
 DEEPSEEK_MODEL := deepseek-flash
+# Workspace the TUI session is sandboxed to. Override with: make tui W=/path/to/project
+WORKSPACE    ?= $(CURDIR)
 
 .PHONY: fmt fmt-check clippy test check build run tui tui-demo serve doctor bench
 
@@ -50,14 +53,19 @@ run-mock: $(BINARY)
 # ── TUI (Ink, TypeScript) ──────────────────────────────────────────────────
 
 ## tui: terminal ChatGPT with DeepSeek (Ink, fresh session per launch)
-tui: $(SERVER_BIN)
+tui: $(SERVER_BIN) $(UI_MODULES)
 	cd $(UI_DIR) && npx tsx src/main.tsx \
 		--provider deepseek --model $(DEEPSEEK_MODEL) \
+		--workspace $(WORKSPACE) \
 		--binary ../$(SERVER_BIN)
 
 ## tui-demo: offline Ink UI demonstration using the deterministic fake client
-tui-demo:
+tui-demo: $(UI_MODULES)
 	cd $(UI_DIR) && npm run demo
+
+# The TUI lives in a separate npm package, so install its deps before running.
+$(UI_MODULES): $(UI_DIR)/package.json $(UI_DIR)/package-lock.json
+	cd $(UI_DIR) && npm ci
 
 # ── Utility ─────────────────────────────────────────────────────────────────
 

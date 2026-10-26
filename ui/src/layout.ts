@@ -107,10 +107,16 @@ export interface TerminalSize {
 /** Track terminal dimensions without forcing callers to read process.stdout. */
 export function useTerminalSize(): TerminalSize {
   const { stdout } = useStdout();
-  const readSize = (): TerminalSize => ({
-    columns: Math.max(1, stdout.columns ?? process.stdout.columns ?? 80),
-    rows: Math.max(1, stdout.rows ?? process.stdout.rows ?? 24),
-  });
+  // A pty can report 0x0 (CI, `script`, detached terminals); `??` would keep
+  // that 0 and collapse the layout to a single column, so treat it as absent.
+  const readSize = (): TerminalSize => {
+    const columns = stdout.columns || process.stdout.columns || 0;
+    const rows = stdout.rows || process.stdout.rows || 0;
+    return {
+      columns: columns > 0 ? columns : 80,
+      rows: rows > 0 ? rows : 24,
+    };
+  };
   const [size, setSize] = useState<TerminalSize>(readSize);
 
   useEffect(() => {
