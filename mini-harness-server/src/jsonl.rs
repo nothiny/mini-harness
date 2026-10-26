@@ -67,6 +67,40 @@ struct ProtocolError {
 type SharedStdout = Arc<Mutex<BufWriter<Stdout>>>;
 type TurnOutcome = Arc<Result<String, mini_harness::HarnessError>>;
 
+/// 会话的可观察元数据。`session.create` / `session.resume` 把它放在
+/// `result.context` 里返回，客户端（Ink TUI）据此渲染标题栏。
+///
+/// 这些值必须来自服务端真实的解析结果（而不是客户端传进来的参数），
+/// 否则 UI 会诚实地说 `unknown`。
+#[derive(Debug, Serialize)]
+struct SessionContext {
+    workspace: String,
+    provider: String,
+    model: Option<String>,
+    execution_environment: ExecutionEnvironment,
+}
+
+/// 执行环境的能力声明。刻意只描述本进程真实做过的事:
+/// 文件系统受 workspace 边界约束，网络不做隔离，运行在宿主机上。
+#[derive(Debug, Serialize)]
+struct ExecutionEnvironment {
+    platform: &'static str,
+    filesystem: &'static str,
+    network: &'static str,
+    environment: &'static str,
+}
+
+impl ExecutionEnvironment {
+    fn local() -> Self {
+        Self {
+            platform: std::env::consts::OS,
+            filesystem: "workspace-scoped",
+            network: "unrestricted",
+            environment: "local",
+        }
+    }
+}
+
 /// 一个活动会话: Session 本体 + 终止结果表。
 struct SessionSlot {
     session: Session<ConfiguredProvider, LocalExecutor, JsonlEventStore>,
@@ -337,7 +371,7 @@ async fn create_session(state: &mut ServerState, params: Value) -> Result<Value,
         store.clone(),
     )
     .await?;
-    state.slot = Some(slot.clone());
+    state.slot = Some(slot.slot.clone());
     state.session_id = Some(session_id);
     {
         let mut cursor = state.events.lock().await;
@@ -346,7 +380,7 @@ async fn create_session(state: &mut ServerState, params: Value) -> Result<Value,
     }
     state.response_next_event = EventSeq(1);
     tracing::info!(target: "mini_harness::serve", session_id = %session_id, "session created");
-    Ok(json!({"session_id": session_id}))
+    Ok(json!({"session_id": session_id, "context": slot.context}))
 }
 
 async fn resume_session(state: &mut ServerState, params: Value) -> Result<Value, ProtocolError> {
@@ -380,7 +414,7 @@ async fn resume_session(state: &mut ServerState, params: Value) -> Result<Value,
         store.clone(),
     )
     .await?;
-    state.slot = Some(slot);
+    state.slot = Some(slot.slot.clone());
     state.session_id = Some(params.session_id);
     {
         let mut cursor = state.events.lock().await;
@@ -390,7 +424,13 @@ async fn resume_session(state: &mut ServerState, params: Value) -> Result<Value,
     state.response_next_event = next_event;
     tracing::info!(target: "mini_harness::serve", session_id = %params.session_id, "session resumed");
     // v2 协议不重放历史: 客户端通过事件通知增量消费。
-    Ok(json!({"session_id": params.session_id}))
+    Ok(json!({"session_id": params.session_id, "context": slot.context}))
+}
+
+/// `build_slot` 的产物: 会话本体 + 要回给客户端的元数据。
+struct BuiltSlot {
+    slot: Arc<Mutex<SessionSlot>>,
+    context: SessionContext,
 }
 
 async fn build_slot(
@@ -400,10 +440,21 @@ async fn build_slot(
     provider: Option<String>,
     model: Option<String>,
     store: Arc<JsonlEventStore>,
-) -> Result<Arc<Mutex<SessionSlot>>, ProtocolError> {
+) -> Result<BuiltSlot, ProtocolError> {
     let provider_name = provider.unwrap_or_else(|| state.config.model.provider.clone());
     let model_name = model.or_else(|| state.config.model.name.clone());
     let provider = configured_provider(Some(provider_name.as_str()), model_name.as_deref())?;
+    // `workspace` 被移动进 executor，先把要上报的字符串留下来；
+    // 用绝对路径，否则 TUI 只会显示 "."。
+    let context = SessionContext {
+        workspace: std::path::absolute(&workspace)
+            .unwrap_or_else(|_| workspace.clone())
+            .display()
+            .to_string(),
+        provider: provider_name,
+        model: model_name,
+        execution_environment: ExecutionEnvironment::local(),
+    };
     let session = Session::resume_with_policy(
         Arc::new(provider),
         Arc::new(
@@ -419,11 +470,14 @@ async fn build_slot(
     .await
     .map_err(internal_error)?;
     let (version, _) = watch::channel(0);
-    Ok(Arc::new(Mutex::new(SessionSlot {
-        session,
-        outcomes: HashMap::new(),
-        version,
-    })))
+    Ok(BuiltSlot {
+        slot: Arc::new(Mutex::new(SessionSlot {
+            session,
+            outcomes: HashMap::new(),
+            version,
+        })),
+        context,
+    })
 }
 
 /// Builds the standard read/edit/bash registry from configuration.

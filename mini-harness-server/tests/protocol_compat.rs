@@ -86,6 +86,68 @@ fn wait_response_events_use_the_safe_projection() {
 }
 
 #[test]
+fn create_and_resume_report_session_context() {
+    let directory = tempdir().unwrap();
+    let log = directory.path().join("events.jsonl");
+    let (child, mut input, mut output) = spawn_server();
+    send(
+        &mut input,
+        serde_json::json!({"id":1, "method":"session.create", "params":{
+            "event_log": log,
+            "workspace": directory.path(),
+            "provider": "mock",
+            "model": "demo-model",
+        }}),
+    );
+    let created = read_response(&mut output, 1);
+    let context = &created["result"]["context"];
+    // The TUI renders exactly these fields in its header; if the server stops
+    // sending them the header silently degrades to "unknown".
+    assert_eq!(context["provider"], "mock");
+    assert_eq!(context["model"], "demo-model");
+    assert!(
+        context["workspace"].as_str().unwrap().starts_with('/'),
+        "workspace should be absolute, got {:?}",
+        context["workspace"]
+    );
+    let environment = &context["execution_environment"];
+    for field in ["platform", "filesystem", "network", "environment"] {
+        assert!(
+            environment[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "execution_environment.{field} missing"
+        );
+    }
+    assert!(environment["platform"].as_str() != Some("unknown"));
+    let session_id = created["result"]["session_id"].clone();
+    shutdown(child, input, &mut output);
+
+    // `session.resume` must report the same context shape (the TUI takes both
+    // paths depending on whether the log already exists).
+    let (child, mut input, mut output) = spawn_server();
+    send(
+        &mut input,
+        serde_json::json!({"id":1, "method":"session.resume", "params":{
+            "event_log": log,
+            "session_id": session_id,
+            "workspace": directory.path(),
+            "provider": "mock",
+        }}),
+    );
+    let resumed = read_response(&mut output, 1);
+    let context = &resumed["result"]["context"];
+    assert_eq!(context["provider"], "mock");
+    assert!(
+        context["workspace"].as_str().unwrap().starts_with('/'),
+        "workspace should be absolute, got {:?}",
+        context["workspace"]
+    );
+    assert!(context["execution_environment"]["filesystem"].is_string());
+    shutdown(child, input, &mut output);
+}
+
+#[test]
 fn protocol_negotiate_reports_revision_and_message_limit() {
     let (mut child, mut input, mut output) = spawn_server();
     send(
