@@ -10,8 +10,7 @@ fn benchmark_runs_manifest_without_waiting_for_approval() {
     std::fs::write(
         &manifest,
         format!(
-            "name = \"smoke\"\n[[tasks]]\nid = \"hello\"\nprompt = \"say hello\"\nworkspace = {:?}\n",
-            workspace
+            "name = \"smoke\"\n[[tasks]]\nid = \"hello\"\nprompt = \"say hello\"\nworkspace = {workspace:?}\n"
         ),
     )
     .unwrap();

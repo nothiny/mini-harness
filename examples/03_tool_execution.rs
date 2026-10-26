@@ -50,13 +50,13 @@ async fn main() {
         .start_turn("运行命令".into())
         .await
         .expect_err("approval pending");
-    println!("turn 暂停: {}", error);
+    println!("turn 暂停: {error}");
     println!("副作用尚未发生: {}", !marker.exists());
     let turn_id = session.state().active_turn.as_ref().unwrap().turn_id;
 
     // 3. 用户批准 → 工具执行 → turn 继续直到完成
     let (turn, text) = session.approve_tool(turn_id, call_id, true).await.unwrap();
-    println!("\n批准后 turn {} 完成: {}", turn, text);
+    println!("\n批准后 turn {turn} 完成: {text}");
     println!("副作用已发生: {}", marker.exists());
 
     // 4. 事件序列展示了完整的审批协议
@@ -66,11 +66,11 @@ async fn main() {
         let detail = match &event.payload {
             EventPayload::ToolRequested {
                 requires_approval, ..
-            } => format!("（requires_approval={}）", requires_approval),
+            } => format!("（requires_approval={requires_approval}）"),
             EventPayload::ToolApprovalResponded { approved, .. } => {
-                format!("（approved={}）", approved)
+                format!("（approved={approved}）")
             }
-            EventPayload::ToolCompleted { duration_ms, .. } => format!("（{}ms）", duration_ms),
+            EventPayload::ToolCompleted { duration_ms, .. } => format!("（{duration_ms}ms）"),
             _ => String::new(),
         };
         println!(

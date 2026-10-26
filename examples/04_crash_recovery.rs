@@ -99,7 +99,7 @@ async fn main() {
     }
 
     let (_, text) = resumed.start_turn("崩溃恢复后继续".into()).await.unwrap();
-    println!("新 turn 完成: {}\n", text);
+    println!("新 turn 完成: {text}\n");
 
     println!("关键点:");
     println!("  1. 恢复不需要额外数据: 事件日志是唯一事实");

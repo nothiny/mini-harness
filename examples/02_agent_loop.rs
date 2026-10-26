@@ -57,8 +57,8 @@ async fn main() {
         .await
         .expect("turn completes");
 
-    println!("turn {} 完成:", turn_id);
-    println!("  最终回答: {}\n", output);
+    println!("turn {turn_id} 完成:");
+    println!("  最终回答: {output}\n");
 
     // 4. 事件日志是唯一事实: 每个 turn 的事实一目了然
     let events = store.read_from(EventSeq(1)).await.unwrap();
